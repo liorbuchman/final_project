@@ -1,0 +1,18 @@
+# התעלם מקבצי אודיו ודאטה
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+data/
+datasets/
+recordings/
+audio/
+sounds/
+
+# התעלם מקבצים זמניים של VS Code / פייתון
+__pycache__/
+.vscode/
+*.log
+.env
+venv/
