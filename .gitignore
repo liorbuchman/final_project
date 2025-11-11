@@ -3,7 +3,7 @@
 *.flac
 *.ogg
 *.m4a
-data/
+#data/
 datasets/
 recordings/
 audio/

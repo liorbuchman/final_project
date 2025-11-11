@@ -109,11 +109,12 @@ def process_audio():
             out_dir.mkdir(parents=True, exist_ok=True)
 
             for idx, seg in enumerate(segments):
-                mel = compute_logmel(seg, SR)
                 out_path = out_dir / f"{path.stem}_{int(CHUNK_SECS*1000)}ms_seg{idx:04d}.npy" # determine the file name
+               
                 if SKIP_IF_EXISTS and out_path.exists():
                 # print(f"[INFO] Exists, skipping: {out_path.name}")
                     continue
+                mel = compute_logmel(seg, SR)
                 np.save(out_path, mel)
                 total_segments += 1
 
