@@ -28,3 +28,6 @@ dependencies:
       - pyaudio        
       - pyqtgraph     
       - mediapipe      
+      - onvif-zeep
+      - wsdiscovery
+      - requests

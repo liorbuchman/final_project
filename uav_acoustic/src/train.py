@@ -29,10 +29,10 @@ PROCESSED_DIR = Path(r"C:\final_project\uav_acoustic\data\processed")
 CHECKPOINT_DIR = Path(r"C:\final_project\uav_acoustic\models")
 
 RANDOM_SEED = 42
-BATCH_SIZE = 64
-EPOCHS = 15
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
+BATCH_SIZE = 64 # number of samples per batch 
+EPOCHS = 15 #number of times the entire dataset is passed forward and backward through the neural network
+LEARNING_RATE = 1e-3 #maximun step size for updating the weights
+WEIGHT_DECAY = 1e-4 #regularization technique to reduce overfitting
 NUM_WORKERS = 2  # keep small on Windows
 
 # Normalization stats file (computed once on a subset of train)
@@ -42,14 +42,14 @@ MAX_FILES_FOR_NORM = 2000
 # =====================
 # Utils
 # =====================
-
+#function to set random seed for calculate mean and std
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
+#function to list label directories for each split
 def list_label_dirs(split_dir: Path) -> List[Path]:
     out = []
     if not split_dir.exists():
@@ -59,7 +59,7 @@ def list_label_dirs(split_dir: Path) -> List[Path]:
             out.append(d)
     return sorted(out)
 
-
+#fuction to discover classes from train/ directory
 def discover_classes(root: Path) -> Tuple[List[str], Dict[str, int]]:
     train_dir = root / "train"
     labels = [p.name for p in list_label_dirs(train_dir)]
