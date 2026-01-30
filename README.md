@@ -32,5 +32,3 @@ The current environment is managed via Conda/Pip:
 1. **Environment:** Use `uav_acoustic/configs/environment.yml` to recreate the environment.
 2. **Firmware:** The `6_channels_firmware.bin` and `dfu.py` are provided for microphone array configuration.
 
-## 👥 Contributors
-* Final Project - University Submission (2026)
