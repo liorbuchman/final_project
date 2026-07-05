@@ -1,14 +1,17 @@
 <title>UAV Multi-Modal Detection Dashboard</title>
 <script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" crossorigin></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js" crossorigin></script>
 
 <style>
-  html, body { background:#0b0d10; color:#e5e7eb; height:100%; }
-  #root { min-height:100vh; }
+  html, body { background:#0b0d10; color:#e5e7eb; height:100%; margin:0; overflow:hidden; }
+  #root { height:100vh; overflow:hidden; }
   .tabular-nums { font-variant-numeric: tabular-nums; }
+
+  .tab-btn { padding:6px 14px; font-size:0.8rem; border-bottom:2px solid transparent; color:#8b93a1; }
+  .tab-btn.active { color:#e5e7eb; border-bottom-color:#3b82f6; }
 
   @keyframes breathe { 0%,100%{opacity:.45} 50%{opacity:1} }
   @keyframes blink2hz { 0%,49%{opacity:1} 50%,100%{opacity:.3} }
@@ -34,8 +37,25 @@
   ::-webkit-scrollbar { width:8px; height:8px; }
   ::-webkit-scrollbar-thumb { background:#3a4048; border-radius:4px; }
 
-  .spectro-canvas { image-rendering: pixelated; width:100%; height:160px; background:#000; }
+  .spectro-canvas { image-rendering: pixelated; width:100%; height:100%; background:#000; }
   .pending-ring { box-shadow: 0 0 0 2px #eab308 inset; }
+
+  /* --- Structural skeleton: plain hand-written CSS, not Tailwind utility classes.
+     These are load-bearing (must never collapse/overflow) so they cannot depend on
+     the Tailwind CDN's runtime JIT compiler having generated the right rules in time.
+     Tailwind classes are still used everywhere else for color/spacing/decoration. --- */
+  .app-shell { height: 100vh; width: 100vw; overflow: hidden; display: flex; flex-direction: column; position: relative; }
+  .header-bar { min-height: 64px; flex-shrink: 0; flex-wrap: wrap; row-gap: 4px; }
+  .header-bar > * { flex-shrink: 0; white-space: nowrap; }
+  .main-row { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: row; overflow: hidden; }
+  .tactical-col { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+  .video-box { flex: 3 1 0; min-height: 0; position: relative; overflow: hidden; background: #000; }
+  .radar-box { flex: 1 1 0; min-height: 100px; overflow: hidden; }
+  .sidebar-col { width: 320px; flex-shrink: 0; min-height: 0; overflow-y: auto; }
+  .bottom-panel { flex-shrink: 0; height: 240px; overflow: hidden; display: flex; flex-direction: column; }
+  .tab-scroll-area { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  .chart-mini { height: 90px; overflow: hidden; display: flex; flex-direction: column; }
+  .chart-mini canvas { flex: 1 1 auto; min-height: 0; width: 100%; }
 </style>
 
 <div id="root"></div>
@@ -97,6 +117,13 @@ function App() {
   const [highContrast, setHighContrast] = useState(false);
   const [alarmMuted, setAlarmMuted] = useState(false);
   const [simActive, setSimActive] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [recordingFile, setRecordingFile] = useState(null);
+  const [mode, setMode] = useState("live");
+  const [replayFile, setReplayFile] = useState(null);
+  const [availableRecordings, setAvailableRecordings] = useState([]);
+  const [selectedRecording, setSelectedRecording] = useState("");
+  const [activeTab, setActiveTab] = useState("System Logs");
 
   const wsRef = useRef(null);
   const backoffRef = useRef(1000);
@@ -107,6 +134,10 @@ function App() {
   const waveChartRef = useRef(null);
   const waveCanvasRef = useRef(null);
 
+  function refreshRecordings() {
+    fetch("/recordings").then(r => r.json()).then(d => setAvailableRecordings(d.files || [])).catch(() => {});
+  }
+
   const connect = useCallback(() => {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -116,6 +147,7 @@ function App() {
       setConnected(true);
       setReconnecting(false);
       backoffRef.current = 1000;
+      refreshRecordings();
     };
     ws.onclose = () => {
       setConnected(false);
@@ -161,7 +193,15 @@ function App() {
         case "event":
           setEvents(prev => [msg, ...prev].slice(0, 100));
           break;
+        case "recording_state":
+          setRecording(!!msg.recording);
+          setRecordingFile(msg.file || null);
+          if (!msg.recording) refreshRecordings();
+          break;
         case "mode":
+          setMode(msg.mode);
+          setReplayFile(msg.file || null);
+          if (msg.mode === "replay") setSelectedRecording(msg.file || "");
           break;
         default:
           break;
@@ -215,6 +255,20 @@ function App() {
   function toggleSystem() {
     if (!settings) return;
     updateSetting("system_active", !settings.system_active);
+  }
+
+  function toggleRecording() {
+    sendCommand({ command: "set_recording", enabled: !recording });
+  }
+
+  function onSelectReplay(e) {
+    const file = e.target.value;
+    setSelectedRecording(file);
+    if (!file) {
+      sendCommand({ command: "set_mode", mode: "live" });
+    } else {
+      sendCommand({ command: "set_mode", mode: "replay", file });
+    }
   }
 
   // ---------- Radar (Component D) ----------
@@ -356,34 +410,61 @@ function App() {
   const camera = telemetry?.camera || { connected: false, fps: 0 };
   const audio = telemetry?.audio || { active: false, db: null };
   const jetson = telemetry?.jetson || { cpu: null, gpu: null, temp_c: null };
+  const TABS = ["System Logs", "Performance Charts", "Detection Events"];
 
   return (
-    <div className={(highContrast ? "hc " : "") + (state === "ENGAGED" ? "engaged-flash " : "") + "min-h-screen p-3 gap-3 grid grid-cols-12"}>
+    <div className={(highContrast ? "hc " : "") + (state === "ENGAGED" ? "engaged-flash " : "") + "app-shell"}>
 
-      {/* Component A: Header */}
-      <div className="col-span-12 bg-panel rounded-lg p-3 flex flex-wrap items-center gap-4">
-        <div className="flex items-center gap-2 pr-4 border-r border-gray-700">
+      {/* Alert overlay - absolute, never affects layout height or scroll */}
+      {(state === "ENGAGED" || state === "DEGRADED") && (
+        <div className="absolute top-0 inset-x-0 z-40 flex justify-center px-3 pt-2 pointer-events-none">
+          {state === "ENGAGED" && (
+            <div className="pointer-events-auto bg-red-700 text-white text-center py-1 px-6 rounded-b-lg font-bold animate-pulse shadow-lg">
+              TARGET ENGAGED
+            </div>
+          )}
+          {state === "DEGRADED" && (
+            <div className="pointer-events-auto bg-red-900 border border-red-500 text-red-200 text-center py-1 px-6 rounded-b-lg shadow-lg">
+              DEGRADED — hardware fault detected, attempting recovery
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Header: fixed height (guaranteed via .header-bar), hidden (not unmounted) in Presentation Mode */}
+      <div className={(debugMode ? "flex" : "hidden") + " header-bar items-center gap-3 bg-panel px-4 border-b border-gray-800 overflow-hidden"}>
+        <div className="flex items-center gap-2 pr-4 border-r border-gray-700 shrink-0">
           <span className={`w-4 h-4 rounded-full inline-block ${STATE_COLORS[state]}`}></span>
           <span className="font-bold tracking-wide">{state}</span>
-          {simActive && <span className="ml-2 text-xs bg-yellow-600 text-black px-2 py-0.5 rounded font-bold">SIM</span>}
+          {simActive && (
+            <span className="ml-2 text-xs bg-red-600 text-white px-2 py-0.5 rounded font-extrabold tracking-wider animate-pulse">
+              SIMULATOR / REPLAY
+            </span>
+          )}
         </div>
 
         <HeaderStat label="Camera" ok={camera.connected} okText={`Connected · ${fmt(camera.fps,1)} FPS`} badText="Disconnected" />
         <HeaderStat label="Mic Array" ok={audio.active} okText={`Active · ${fmt(audio.db,1)} dB`} badText="Muted" />
-        <div className="text-sm">
+        <div className="text-sm shrink-0">
           <div className="text-gray-400 text-xs">Jetson</div>
           <div className="tabular-nums">CPU {jetson.cpu ?? "N/A"}% · GPU {jetson.gpu ?? "N/A"}% · {jetson.temp_c ?? "N/A"}°C</div>
         </div>
-        <div className="text-sm">
+        <div className="text-sm shrink-0">
           <div className="text-gray-400 text-xs">Link</div>
           <div className={connected ? "text-green-400" : "text-red-400"}>{connected ? "Connected" : (reconnecting ? "Reconnecting…" : "Down")}</div>
         </div>
-        <div className="text-sm">
+        <div className="text-sm shrink-0">
           <div className="text-gray-400 text-xs">End-to-End Latency</div>
           <div className="tabular-nums">{latencyMs !== null ? `${fmt(latencyMs,0)} ms` : "N/A"}</div>
         </div>
+        <div className="text-sm shrink-0">
+          <div className="text-gray-400 text-xs">Mode</div>
+          <div className={mode === "replay" ? "text-red-400 font-semibold" : "text-gray-300"}>
+            {mode === "replay" ? `REPLAY · ${replayFile || ""}` : "LIVE"}
+          </div>
+        </div>
 
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-2 shrink-0">
           <button onClick={() => setAlarmMuted(v => !v)}
             className={`px-3 py-1.5 rounded text-sm ${alarmMuted ? "bg-gray-700" : "bg-blue-700"}`}>
             {alarmMuted ? "Alarm Muted" : "Alarm On"}
@@ -391,6 +472,25 @@ function App() {
           <button onClick={() => setHighContrast(v => !v)} className="px-3 py-1.5 rounded text-sm bg-gray-700" title="High-contrast mode for projector">
             Contrast
           </button>
+
+          <div className="w-px self-stretch bg-gray-700 mx-1"></div>
+
+          <button disabled={!connected} onClick={toggleRecording}
+            title="Capture live telemetry + spectrogram to a session file for later replay"
+            className={`px-3 py-1.5 rounded text-sm font-semibold flex items-center gap-1.5 disabled:opacity-40 ${recording ? "bg-red-700" : "bg-gray-700"}`}>
+            <span className={`w-2 h-2 rounded-full inline-block ${recording ? "bg-red-300 animate-pulse" : "bg-gray-400"}`}></span>
+            {recording ? "Recording…" : "Record Session"}
+          </button>
+
+          <select disabled={!connected} value={selectedRecording} onChange={onSelectReplay}
+            title="Replay a recorded session — the GUI behaves identically to live"
+            className="bg-gray-800 border border-gray-600 rounded text-sm px-2 py-1.5 disabled:opacity-40">
+            <option value="">Live</option>
+            {availableRecordings.map(f => <option key={f} value={f}>{f}</option>)}
+          </select>
+
+          <div className="w-px self-stretch bg-gray-700 mx-1"></div>
+
           <button disabled={!connected} onClick={toggleSystem}
             className={`px-4 py-1.5 rounded font-bold text-sm ${settings?.system_active ? "bg-red-600" : "bg-green-600"} disabled:opacity-40`}>
             {settings?.system_active ? "STOP" : "START"}
@@ -398,144 +498,153 @@ function App() {
         </div>
       </div>
 
-      {state === "ENGAGED" && (
-        <div className="col-span-12 bg-red-700 text-white text-center py-1 rounded font-bold animate-pulse">
-          TARGET ENGAGED
-        </div>
-      )}
-      {state === "DEGRADED" && (
-        <div className="col-span-12 bg-red-900 border border-red-500 text-red-200 text-center py-1 rounded">
-          DEGRADED — hardware fault detected, attempting recovery
-        </div>
-      )}
+      {/* Main-Content: fills everything between the header and the fixed-height bottom
+          panel (guaranteed via .main-row). Tactical-Col (left) + Diagnostics-Col (right). */}
+      <div className="main-row">
 
-      {/* Component B: Video */}
-      <div className={debugMode ? "col-span-7" : "col-span-8"}>
-        <div className="bg-panel rounded-lg p-3 h-full flex flex-col">
-          <div className="flex justify-between items-center mb-2">
-            <h2 className="font-semibold text-sm text-gray-300">Vision Feed</h2>
-            <label className="text-xs flex items-center gap-1">
-              <input type="checkbox" checked={!!settings?.draw_boxes}
-                onChange={e => updateSetting("draw_boxes", e.target.checked)} />
-              Bounding Boxes
-            </label>
+        {/* Tactical-Col: video+radar stacked via flex-grow ratios (3:1, guaranteed via
+            .tactical-col/.video-box/.radar-box) so neither can ever balloon past what
+            the column actually has - no aspect-ratio, no reliance on content size. */}
+        <div className={"tactical-col w-2/3 " + (debugMode ? "gap-3 p-3" : "gap-0 p-0")}>
+          {debugMode && (
+            <div className="shrink-0 flex justify-between items-center">
+              <h2 className="font-semibold text-sm text-gray-300">Vision Feed</h2>
+              <label className="text-xs flex items-center gap-1">
+                <input type="checkbox" checked={!!settings?.draw_boxes}
+                  onChange={e => updateSetting("draw_boxes", e.target.checked)} />
+                Bounding Boxes
+              </label>
+            </div>
+          )}
+
+          {/* Video: always mounted <img>, sized by flex-grow (not aspect-ratio) so it
+              never dictates its own height from stream content - no reflow, no flicker. */}
+          <div className={"video-box w-full " + (debugMode ? "rounded-lg" : "")}>
+            <img src="/video_feed" className="absolute inset-0 w-full h-full object-contain bg-black" />
+            {!camera.connected && (
+              <div className="absolute inset-0 flex items-center justify-center text-gray-500 font-mono text-2xl bg-black">
+                NO SIGNAL
+              </div>
+            )}
           </div>
-          <div className="relative flex-1 bg-black rounded overflow-hidden" style={{ minHeight: debugMode ? 360 : 520 }}>
-            {camera.connected
-              ? <img src="/video_feed" className="w-full h-full object-contain" />
-              : <div className="absolute inset-0 flex items-center justify-center text-gray-500 font-mono text-2xl">NO SIGNAL</div>}
+
+          {debugMode && (
+            <div className="shrink-0">
+              <div className="text-xs text-gray-400 mb-1">YOLO Confidence</div>
+              <div className="w-full bg-gray-800 rounded h-3">
+                <div className="bg-green-500 h-3 rounded tabular-nums" style={{ width: `${(telemetry?.vision?.confidence || 0) * 100}%` }}></div>
+              </div>
+            </div>
+          )}
+
+          {/* Radar: guaranteed via .radar-box (flex:1, min-height:100px - can never collapse). */}
+          <div className={"radar-box w-full bg-panel p-2 " + (debugMode ? "rounded-lg" : "")}>
+            <canvas ref={radarCanvasRef} className="w-full h-full block"></canvas>
           </div>
-          <div className="mt-2">
-            <div className="text-xs text-gray-400 mb-1">YOLO Confidence</div>
-            <div className="w-full bg-gray-800 rounded h-3">
-              <div className="bg-green-500 h-3 rounded tabular-nums" style={{ width: `${(telemetry?.vision?.confidence || 0) * 100}%` }}></div>
+        </div>
+
+        {/* Diagnostics-Col: guaranteed fixed width via .sidebar-col, always mounted,
+            CSS-hidden (not unmounted) in Presentation Mode, internally scrollable so
+            it's never pushed off-screen. */}
+        <div className={(debugMode ? "flex" : "hidden") + " sidebar-col flex-col bg-panel p-3 border-l border-gray-800"}>
+          <h2 className="font-semibold text-sm text-gray-300 mb-3 shrink-0">Hyperparameter Control Panel</h2>
+          <div className="flex flex-col gap-3">
+            {SLIDER_DEFS.map(def => (
+              <div key={def.key} title={def.tip} className={pending[def.key] ? "pending-ring rounded p-1" : "p-1"}>
+                <div className="text-xs text-gray-400 flex justify-between">
+                  <span>{def.label}</span>
+                  <span className="tabular-nums">{settings ? settings[def.key] : "--"}</span>
+                </div>
+                <input type="range" min={def.min} max={def.max} step={def.step}
+                  disabled={!connected}
+                  value={settings ? settings[def.key] : def.min}
+                  onChange={e => updateSetting(def.key, parseFloat(e.target.value))}
+                  className="w-full" />
+              </div>
+            ))}
+            <div title="Inverts the camera pan/tilt axes to dynamically compensate for the upside-down physical installation of the PTZ housing on the tactical rig."
+              className={"p-1 flex items-center gap-2 " + (pending.invert_camera_vector ? "pending-ring rounded" : "")}>
+              <input type="checkbox" disabled={!connected} checked={!!settings?.invert_camera_vector}
+                onChange={e => updateSetting("invert_camera_vector", e.target.checked)} />
+              <span className="text-xs text-gray-300">Invert PTZ Camera Vector</span>
             </div>
           </div>
         </div>
       </div>
 
-      {/* Component C: Audio */}
-      <div className={debugMode ? "col-span-5" : "col-span-4"}>
-        <div className="bg-panel rounded-lg p-3 h-full flex flex-col gap-3">
-          <h2 className="font-semibold text-sm text-gray-300">Audio Analytics & DSP</h2>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Audio CNN — Drone vs Background</div>
-            <div className="w-full bg-gray-800 rounded h-3 flex overflow-hidden">
-              <div className="bg-sky-500 h-3" style={{ width: `${(telemetry?.acoustic?.confidence || 0) * 100}%` }}></div>
-            </div>
-            <div className="text-xs tabular-nums text-gray-400 mt-1">{fmt((telemetry?.acoustic?.confidence||0)*100,0)}% drone</div>
+      {/* Bottom-Panel: guaranteed fixed height via .bottom-panel, separate section outside
+          the main-content row entirely. Logs / Charts / Events tabs stay mounted at all
+          times - only CSS display toggles between them, so nothing WebSocket-fed is torn
+          down. Charts/logs never need scroll by design; only the events table body does. */}
+      <div className={(debugMode ? "flex" : "hidden") + " bottom-panel mx-3 mb-3 bg-panel rounded-lg border border-gray-800"}>
+        <div className="shrink-0 flex items-center border-b border-gray-800 px-2">
+          {TABS.map(tab => (
+            <button key={tab} onClick={() => setActiveTab(tab)} className={"tab-btn" + (activeTab === tab ? " active" : "")}>
+              {tab}
+            </button>
+          ))}
+          {activeTab === "Detection Events" && (
+            <button onClick={exportCSV} className="ml-auto my-1 text-xs bg-gray-700 px-3 py-1 rounded">Export CSV</button>
+          )}
+        </div>
+
+        <div className="tab-scroll-area p-3">
+          <div className={(activeTab === "System Logs" ? "block" : "hidden") + " bg-black rounded p-2 font-mono text-xs"}>
+            {logs.map((l, i) => (
+              <div key={i} className={
+                l.level === "ERROR" ? "text-red-400" : l.level === "WARNING" ? "text-yellow-400" : "text-gray-400"
+              }>
+                [{new Date(l.ts * 1000).toLocaleTimeString()}] {l.level}: {l.msg}
+              </div>
+            ))}
           </div>
-          {debugMode && (
+
+          <div className={(activeTab === "Performance Charts" ? "grid" : "hidden") + " grid-cols-3 gap-4"}>
             <div>
+              <div className="text-xs text-gray-400 mb-1">Audio CNN — Drone vs Background</div>
+              <div className="w-full bg-gray-800 rounded h-3 flex overflow-hidden">
+                <div className="bg-sky-500 h-3" style={{ width: `${(telemetry?.acoustic?.confidence || 0) * 100}%` }}></div>
+              </div>
+              <div className="text-xs tabular-nums text-gray-400 mt-1">{fmt((telemetry?.acoustic?.confidence||0)*100,0)}% drone</div>
+            </div>
+            <div className="chart-mini">
               <div className="text-xs text-gray-400 mb-1">Live Spectrogram</div>
               <canvas ref={spectroCanvasRef} className="spectro-canvas rounded"></canvas>
             </div>
-          )}
-          <div className="flex-1 min-h-[120px]">
-            <div className="text-xs text-gray-400 mb-1">Waveform</div>
-            <canvas ref={waveCanvasRef} height="120"></canvas>
-          </div>
-        </div>
-      </div>
-
-      {/* Component D: Radar */}
-      <div className={debugMode ? "col-span-6" : "col-span-8"}>
-        <div className="bg-panel rounded-lg p-3">
-          <h2 className="font-semibold text-sm text-gray-300 mb-2">Spatial Awareness Map</h2>
-          <canvas ref={radarCanvasRef} width="560" height="300" className="w-full"></canvas>
-        </div>
-      </div>
-
-      {/* Component E: Controls + Logs */}
-      {debugMode && (
-        <div className="col-span-6">
-          <div className="bg-panel rounded-lg p-3 flex flex-col gap-3 h-full">
-            <h2 className="font-semibold text-sm text-gray-300">Hyperparameter Control Panel</h2>
-            <div className="grid grid-cols-2 gap-3 overflow-y-auto" style={{ maxHeight: 220 }}>
-              {SLIDER_DEFS.map(def => (
-                <div key={def.key} title={def.tip} className={pending[def.key] ? "pending-ring rounded p-1" : "p-1"}>
-                  <div className="text-xs text-gray-400 flex justify-between">
-                    <span>{def.label}</span>
-                    <span className="tabular-nums">{settings ? settings[def.key] : "--"}</span>
-                  </div>
-                  <input type="range" min={def.min} max={def.max} step={def.step}
-                    disabled={!connected}
-                    value={settings ? settings[def.key] : def.min}
-                    onChange={e => updateSetting(def.key, parseFloat(e.target.value))}
-                    className="w-full" />
-                </div>
-              ))}
-              <div title="Inverts the camera pan/tilt axes to dynamically compensate for the upside-down physical installation of the PTZ housing on the tactical rig."
-                className={"p-1 flex items-center gap-2 " + (pending.invert_camera_vector ? "pending-ring rounded" : "")}>
-                <input type="checkbox" disabled={!connected} checked={!!settings?.invert_camera_vector}
-                  onChange={e => updateSetting("invert_camera_vector", e.target.checked)} />
-                <span className="text-xs text-gray-300">Invert PTZ Camera Vector</span>
-              </div>
+            <div className="chart-mini">
+              <div className="text-xs text-gray-400 mb-1">Waveform</div>
+              <canvas ref={waveCanvasRef} className="w-full h-full block"></canvas>
             </div>
+          </div>
 
-            <h2 className="font-semibold text-sm text-gray-300 mt-2">Live System Log</h2>
-            <div className="bg-black rounded p-2 font-mono text-xs flex-1 overflow-y-auto" style={{ minHeight: 140 }}>
-              {logs.map((l, i) => (
-                <div key={i} className={
-                  l.level === "ERROR" ? "text-red-400" : l.level === "WARNING" ? "text-yellow-400" : "text-gray-400"
-                }>
-                  [{new Date(l.ts * 1000).toLocaleTimeString()}] {l.level}: {l.msg}
+          {/* Header row lives OUTSIDE the scrolling body entirely (genuinely fixed, not
+              sticky-in-a-<table> which is a well-known cross-browser overlap landmine).
+              Header and rows share the same gridTemplateColumns so columns line up. */}
+          <div className={(activeTab === "Detection Events" ? "flex" : "hidden") + " flex-col h-full"}>
+            <div className="grid text-gray-400 text-xs font-semibold border-b border-gray-800 shrink-0"
+              style={{ gridTemplateColumns: "1.4fr 1fr 0.8fr 1fr 0.8fr" }}>
+              <div className="p-1">Timestamp</div>
+              <div className="p-1">Modality</div>
+              <div className="p-1">Class</div>
+              <div className="p-1">Confidence</div>
+              <div className="p-1">Azimuth</div>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {events.map((e, i) => (
+                <div key={i}
+                  className={"grid text-xs " + (e.modality === "Fused" ? "bg-red-950/50" : "")}
+                  style={{ gridTemplateColumns: "1.4fr 1fr 0.8fr 1fr 0.8fr" }}>
+                  <div className="p-1 tabular-nums">{new Date(e.ts * 1000).toLocaleTimeString()}</div>
+                  <div className="p-1">{e.modality}{e.sim ? " (SIM)" : ""}</div>
+                  <div className="p-1">{e.cls}</div>
+                  <div className="p-1 tabular-nums">{fmt(e.confidence,2)}</div>
+                  <div className="p-1 tabular-nums">{fmt(e.azimuth_deg,1)}°</div>
                 </div>
               ))}
             </div>
           </div>
         </div>
-      )}
-
-      {/* Component F: Detection Event History */}
-      {debugMode && (
-        <div className="col-span-12">
-          <div className="bg-panel rounded-lg p-3">
-            <div className="flex justify-between items-center mb-2">
-              <h2 className="font-semibold text-sm text-gray-300">Detection Event History</h2>
-              <button onClick={exportCSV} className="text-xs bg-gray-700 px-3 py-1 rounded">Export CSV</button>
-            </div>
-            <div className="overflow-y-auto" style={{ maxHeight: 200 }}>
-              <table className="w-full text-xs">
-                <thead className="text-gray-400 text-left">
-                  <tr><th className="p-1">Timestamp</th><th>Modality</th><th>Class</th><th>Confidence</th><th>Azimuth</th></tr>
-                </thead>
-                <tbody>
-                  {events.map((e, i) => (
-                    <tr key={i} className={e.modality === "Fused" ? "bg-red-950/50" : ""}>
-                      <td className="p-1 tabular-nums">{new Date(e.ts * 1000).toLocaleTimeString()}</td>
-                      <td>{e.modality}{e.sim ? " (SIM)" : ""}</td>
-                      <td>{e.cls}</td>
-                      <td className="tabular-nums">{fmt(e.confidence,2)}</td>
-                      <td className="tabular-nums">{fmt(e.azimuth_deg,1)}°</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
+      </div>
     </div>
   );
 }

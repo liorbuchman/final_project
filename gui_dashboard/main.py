@@ -42,6 +42,8 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 INDEX_HTML_PATH = BASE_DIR / "templates" / "index.html"
+RECORDINGS_DIR = BASE_DIR / "recordings"
+RECORDINGS_DIR.mkdir(exist_ok=True)
 
 logger = logging.getLogger("dashboard")
 logger.setLevel(logging.DEBUG)
@@ -186,6 +188,33 @@ CAMERA_FOV_DEG = 90.0
 MIC_ARRAY_RESOLUTION_DEG = 15.0  # +/- => 30 deg sector
 
 
+def render_vision_frame(cx, cy, size, conf, yolo_threshold, draw_boxes, label_text, visible_margin=0.15):
+    """Shared JPEG renderer used by both the simulated and replay vision
+    pipelines, so a recorded bbox reproduces pixel-identical output later."""
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    frame[:] = (18, 18, 22)
+    for gx in range(0, 640, 80):
+        cv2.line(frame, (gx, 0), (gx, 480), (35, 35, 42), 1)
+    for gy in range(0, 480, 80):
+        cv2.line(frame, (0, gy), (640, gy), (35, 35, 42), 1)
+    cv2.putText(frame, label_text, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (90, 200, 90), 1, cv2.LINE_AA)
+    cv2.putText(frame, time.strftime("%H:%M:%S"), (520, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 150), 1, cv2.LINE_AA)
+
+    if cx is not None and conf >= yolo_threshold - visible_margin:
+        color = (60, 200, 255) if conf >= yolo_threshold else (90, 90, 110)
+        cv2.circle(frame, (int(cx), int(cy)), max(1, int(size / 2)), color, 2, cv2.LINE_AA)
+        if draw_boxes and conf >= yolo_threshold:
+            half = int(size / 2)
+            p1 = (int(cx - half), int(cy - half))
+            p2 = (int(cx + half), int(cy + half))
+            cv2.rectangle(frame, p1, p2, (60, 220, 90), 2)
+            label = f"drone {conf:.2f}"
+            cv2.putText(frame, label, (p1[0], max(0, p1[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 220, 90), 1, cv2.LINE_AA)
+
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+    return buf.tobytes() if ok else None
+
+
 class SimulatedVisionPipeline:
     """Fabricates a moving synthetic target + JPEG frame. Same protocol surface
     as the real TensorRT/YOLO pipeline (see VisionPipeline)."""
@@ -245,30 +274,8 @@ class SimulatedVisionPipeline:
             return None
         t = time.time() - self._t0
         x, y, conf, azimuth, size = self._sim_target(t)
-
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        frame[:] = (18, 18, 22)
-        for gx in range(0, 640, 80):
-            cv2.line(frame, (gx, 0), (gx, 480), (35, 35, 42), 1)
-        for gy in range(0, 480, 80):
-            cv2.line(frame, (0, gy), (640, gy), (35, 35, 42), 1)
-        cv2.putText(frame, "SIMULATED FEED", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (90, 200, 90), 1, cv2.LINE_AA)
-        cv2.putText(frame, time.strftime("%H:%M:%S"), (520, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 150), 1, cv2.LINE_AA)
-
-        target_visible = conf >= self._yolo_threshold - 0.15
-        if target_visible:
-            color = (60, 200, 255) if conf >= self._yolo_threshold else (90, 90, 110)
-            cv2.circle(frame, (int(x), int(y)), int(size / 2), color, 2, cv2.LINE_AA)
-            if self._draw_boxes and conf >= self._yolo_threshold:
-                half = int(size / 2)
-                p1 = (int(x - half), int(y - half))
-                p2 = (int(x + half), int(y + half))
-                cv2.rectangle(frame, p1, p2, (60, 220, 90), 2)
-                label = f"drone {conf:.2f}"
-                cv2.putText(frame, label, (p1[0], max(0, p1[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 220, 90), 1, cv2.LINE_AA)
-
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
-        if not ok:
+        frame_bytes = render_vision_frame(x, y, size, conf, self._yolo_threshold, self._draw_boxes, "SIMULATED FEED")
+        if frame_bytes is None:
             return None
         self._frame_count += 1
         now = time.time()
@@ -277,7 +284,7 @@ class SimulatedVisionPipeline:
             self.fps = round(self._frame_count / elapsed, 1)
             self._frame_count = 0
             self._fps_window_start = now
-        return buf.tobytes()
+        return frame_bytes
 
 
 class SimulatedAudioPipeline:
@@ -350,6 +357,222 @@ class SimulatedAudioPipeline:
         energy = 220 * conf * np.exp(-((rows - peak_row) ** 2) / (2 * spread ** 2))
         col = np.clip(col + energy, 0, 255).astype(np.uint8)
         self._spectrogram[:, -1] = col
+
+
+# --------------------------------------------------------------------------
+# Record / Replay (SPEC.md §9) — a recording is just the exact "telemetry"
+# and "spectrogram" messages already broadcast, one JSON object per line.
+# Replay is a third implementation of the §7 protocols: same interface,
+# same server/frontend code path, zero special-casing elsewhere.
+# --------------------------------------------------------------------------
+
+REPLAY_SPEC_ROWS = 64
+REPLAY_SPEC_COLS = 48
+
+
+class ReplaySource:
+    """Loads a recording once and lets both replay pipelines walk through it
+    in lockstep, paced at the original wall-clock rate and looping forever."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.telemetry: list = []
+        self.spectrogram: list = []
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") == "telemetry":
+                    self.telemetry.append(rec)
+                elif rec.get("type") == "spectrogram":
+                    self.spectrogram.append(rec)
+
+        all_ts = [r["ts"] for r in self.telemetry] + [r["ts"] for r in self.spectrogram]
+        self.t0_rec = min(all_ts) if all_ts else 0.0
+        self.duration = (max(all_ts) - self.t0_rec) if all_ts else 0.0
+        self.empty = not self.telemetry
+
+        self._t0_wall = time.time()
+        self._tel_idx = 0
+        self._spec_idx = 0
+
+    def start(self):
+        self._t0_wall = time.time()
+        self._tel_idx = 0
+        self._spec_idx = 0
+
+    def _target_rec_time(self) -> float:
+        elapsed = time.time() - self._t0_wall
+        if self.duration > 0:
+            elapsed = elapsed % self.duration
+        return self.t0_rec + elapsed
+
+    def current_telemetry(self) -> Optional[dict]:
+        if self.empty:
+            return None
+        target = self._target_rec_time()
+        if self.telemetry[self._tel_idx]["ts"] > target:
+            self._tel_idx = 0  # loop wrapped around
+        while self._tel_idx < len(self.telemetry) - 1 and self.telemetry[self._tel_idx + 1]["ts"] <= target:
+            self._tel_idx += 1
+        return self.telemetry[self._tel_idx]
+
+    def current_spectrogram(self) -> Optional[dict]:
+        if not self.spectrogram:
+            return None
+        target = self._target_rec_time()
+        if self.spectrogram[self._spec_idx]["ts"] > target:
+            self._spec_idx = 0
+        while self._spec_idx < len(self.spectrogram) - 1 and self.spectrogram[self._spec_idx + 1]["ts"] <= target:
+            self._spec_idx += 1
+        return self.spectrogram[self._spec_idx]
+
+
+class ReplayVisionPipeline:
+    """Replays recorded vision telemetry. Same protocol surface as
+    SimulatedVisionPipeline / the real TensorRT pipeline (see VisionPipeline)."""
+
+    def __init__(self, source: ReplaySource):
+        self.source = source
+        self.connected = False
+        self.fps = 15.0
+        self._running = False
+        self._yolo_threshold = DEFAULT_SETTINGS["yolo_threshold"]
+        self._draw_boxes = DEFAULT_SETTINGS["draw_boxes"]
+
+    def start(self) -> None:
+        self._running = True
+        self.connected = True
+
+    def stop(self) -> None:
+        self._running = False
+        self.connected = False
+
+    def update_params(self, yolo_threshold: float, nms_threshold: float, draw_boxes: bool) -> None:
+        self._yolo_threshold = yolo_threshold
+        self._draw_boxes = draw_boxes
+
+    def latest_result(self) -> Optional[VisionResult]:
+        if not self._running:
+            return None
+        rec = self.source.current_telemetry()
+        if rec is None:
+            return None
+        vis = rec.get("vision", {})
+        dets = [VisionDetection(**d) for d in vis.get("detections", [])]
+        return VisionResult(confidence=vis.get("confidence", 0.0), detections=dets, sensor_ts=time.time())
+
+    def latest_frame(self) -> Optional[bytes]:
+        if not self._running:
+            return None
+        rec = self.source.current_telemetry()
+        if rec is None:
+            return None
+        vis = rec.get("vision", {})
+        conf = vis.get("confidence", 0.0)
+        dets = vis.get("detections") or []
+        if dets:
+            bx, by, bw, bh = dets[0]["bbox"]
+            cx, cy, size = bx + bw / 2, by + bh / 2, max(bw, bh)
+        else:
+            cx = cy = None
+            size = 0
+        return render_vision_frame(cx, cy, size, conf, self._yolo_threshold, self._draw_boxes, "REPLAY FEED")
+
+
+class ReplayAudioPipeline:
+    """Replays recorded audio telemetry + spectrogram. Same protocol surface
+    as SimulatedAudioPipeline / the real Audio-CNN pipeline (see AudioPipeline)."""
+
+    def __init__(self, source: ReplaySource):
+        self.source = source
+        self.active = False
+        self._running = False
+        self._audio_threshold = DEFAULT_SETTINGS["audio_threshold"]
+        self._audio_gain = DEFAULT_SETTINGS["audio_gain"]
+
+    def start(self) -> None:
+        self._running = True
+        self.active = True
+
+    def stop(self) -> None:
+        self._running = False
+        self.active = False
+
+    def update_params(self, audio_threshold: float, audio_gain: float) -> None:
+        self._audio_threshold = audio_threshold
+        self._audio_gain = audio_gain
+
+    def latest_result(self) -> Optional[AudioResult]:
+        if not self._running:
+            return None
+        rec = self.source.current_telemetry()
+        if rec is None:
+            return None
+        audio = rec.get("audio", {})
+        acoustic = rec.get("acoustic", {})
+
+        spec_rec = self.source.current_spectrogram()
+        if spec_rec is not None:
+            raw = base64.b64decode(spec_rec["data"])
+            spec = np.frombuffer(raw, dtype=np.uint8).reshape(spec_rec["rows"], spec_rec["cols"]).copy()
+        else:
+            spec = np.zeros((REPLAY_SPEC_ROWS, REPLAY_SPEC_COLS), dtype=np.uint8)
+
+        return AudioResult(
+            confidence=acoustic.get("confidence", 0.0),
+            doa_deg=acoustic.get("doa_deg", 0.0),
+            db=audio.get("db") if audio.get("db") is not None else -60.0,
+            waveform=rec.get("waveform", []),
+            spectrogram=spec,
+            sensor_ts=time.time(),
+        )
+
+
+class RecordEngine:
+    """Appends broadcast telemetry/spectrogram/event messages to a JSON-lines
+    file while enabled. A recording is nothing more than a capture of exactly
+    what already went out over the WebSocket."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.enabled = False
+        self.filename: Optional[str] = None
+        self._file = None
+
+    def start(self, name: Optional[str] = None) -> str:
+        self.stop()
+        name = name or f"session_{time.strftime('%Y%m%d_%H%M%S')}"
+        if not name.endswith(".jsonl"):
+            name += ".jsonl"
+        self.filename = name
+        self._file = (self.directory / name).open("w", encoding="utf-8")
+        self.enabled = True
+        return name
+
+    def stop(self):
+        if self._file is not None:
+            try:
+                self._file.close()
+            except OSError:
+                pass
+        self._file = None
+        self.enabled = False
+
+    def write(self, payload: dict):
+        if not self.enabled or self._file is None:
+            return
+        try:
+            self._file.write(json.dumps(payload) + "\n")
+            self._file.flush()
+        except OSError as exc:
+            logger.error("Recording write failed: %s", exc)
+            self.stop()
 
 
 # --------------------------------------------------------------------------
@@ -509,16 +732,32 @@ class RuntimeState:
     fsm: FSM = field(default_factory=FSM)
     vision: VisionPipeline = field(default_factory=SimulatedVisionPipeline)
     audio: AudioPipeline = field(default_factory=SimulatedAudioPipeline)
+    live_vision: Optional[VisionPipeline] = None
+    live_audio: Optional[AudioPipeline] = None
+    replay_vision: Optional[ReplayVisionPipeline] = None
+    replay_audio: Optional[ReplayAudioPipeline] = None
     mjpeg_clients: int = 0
     latest_jpeg: Optional[bytes] = None
     mode: str = "live"
+    current_recording_file: Optional[str] = None
     sim_badge_until: float = 0.0
     prev_visual_hit: bool = False
     prev_acoustic_hit: bool = False
     prev_state: str = "IDLE"
+    record_engine: RecordEngine = field(init=False)
+
+    def __post_init__(self):
+        self.live_vision = self.vision
+        self.live_audio = self.audio
+        self.record_engine = RecordEngine(RECORDINGS_DIR)
 
 
 runtime = RuntimeState()
+
+
+def record_if_active(payload: dict):
+    if settings_store.system_active:
+        runtime.record_engine.write(payload)
 
 
 def jetson_metrics() -> dict:
@@ -623,6 +862,7 @@ async def telemetry_loop():
                     ev = _record_event_if_new(
                         "Fused", "drone", vision_result.detections[0].conf, vision_result.detections[0].azimuth_deg
                     )
+                    record_if_active({"type": "event", **ev})
                     await manager.broadcast({"type": "event", **ev})
                 runtime.prev_state = state
 
@@ -633,6 +873,7 @@ async def telemetry_loop():
                         "Visual", vision_result.detections[0].cls, vision_result.confidence,
                         vision_result.detections[0].azimuth_deg,
                     )
+                    record_if_active({"type": "event", **ev})
                     await manager.broadcast({"type": "event", **ev})
                 runtime.prev_visual_hit = visual_hit
             else:
@@ -642,6 +883,7 @@ async def telemetry_loop():
                 acoustic_hit = audio_result.confidence >= settings_store.audio_threshold
                 if acoustic_hit and not runtime.prev_acoustic_hit:
                     ev = _record_event_if_new("Acoustic", "drone", audio_result.confidence, audio_result.doa_deg)
+                    record_if_active({"type": "event", **ev})
                     await manager.broadcast({"type": "event", **ev})
                 runtime.prev_acoustic_hit = acoustic_hit
             else:
@@ -656,7 +898,7 @@ async def telemetry_loop():
                 "ts": now,
                 "state": state,
                 "mode": runtime.mode,
-                "sim": now < runtime.sim_badge_until,
+                "sim": runtime.mode == "replay" or now < runtime.sim_badge_until,
                 "camera": {"connected": bool(active and runtime.vision.connected), "fps": runtime.vision.fps},
                 "audio": {"active": bool(active and runtime.audio.active), "db": audio_result.db if audio_result else None},
                 "jetson": cached_jetson,
@@ -671,6 +913,7 @@ async def telemetry_loop():
                 "waveform": audio_result.waveform if audio_result else [],
                 "sensor_ts": (vision_result.sensor_ts if vision_result else (audio_result.sensor_ts if audio_result else now)),
             }
+            record_if_active(payload)
             await manager.broadcast(payload)
             await asyncio.sleep(interval)
         except Exception as exc:
@@ -688,10 +931,12 @@ async def spectrogram_loop():
                     spec = audio_result.spectrogram
                     payload = {
                         "type": "spectrogram",
+                        "ts": time.time(),
                         "rows": spec.shape[0],
                         "cols": spec.shape[1],
                         "data": base64.b64encode(spec.tobytes()).decode("ascii"),
                     }
+                    record_if_active(payload)
                     await manager.broadcast(payload)
             await asyncio.sleep(interval)
         except Exception as exc:
@@ -726,6 +971,55 @@ def set_system_active(active: bool):
         logger.info("System STOP — pipelines paused")
 
 
+def switch_to_live():
+    """Third protocol implementation swap (§7/§9): point the active pipeline
+    references back at the persistent simulated instances. Server/frontend
+    code elsewhere is untouched — it only ever talks to runtime.vision/audio."""
+    if runtime.mode == "live":
+        return
+    was_active = settings_store.system_active
+    runtime.vision.stop()
+    runtime.audio.stop()
+    runtime.vision = runtime.live_vision
+    runtime.audio = runtime.live_audio
+    runtime.mode = "live"
+    runtime.current_recording_file = None
+    apply_pipeline_params()
+    if was_active:
+        runtime.vision.start()
+        runtime.audio.start()
+    logger.info("Live mode resumed")
+
+
+def switch_to_replay(filename: str) -> bool:
+    path = RECORDINGS_DIR / filename
+    if not path.exists():
+        logger.error("Replay file not found: %s", filename)
+        return False
+
+    source = ReplaySource(path)
+    if source.empty:
+        logger.error("Replay file has no telemetry records: %s", filename)
+        return False
+
+    was_active = settings_store.system_active
+    runtime.vision.stop()
+    runtime.audio.stop()
+
+    runtime.replay_vision = ReplayVisionPipeline(source)
+    runtime.replay_audio = ReplayAudioPipeline(source)
+    runtime.vision = runtime.replay_vision
+    runtime.audio = runtime.replay_audio
+    runtime.mode = "replay"
+    runtime.current_recording_file = filename
+    apply_pipeline_params()
+    if was_active:
+        runtime.vision.start()
+        runtime.audio.start()
+    logger.info("Replay mode engaged: %s", filename)
+    return True
+
+
 # --------------------------------------------------------------------------
 # FastAPI app
 # --------------------------------------------------------------------------
@@ -752,9 +1046,20 @@ async def on_startup():
     logger.info("Dashboard backend started (Phase 1 — simulated pipelines)")
 
 
+@app.on_event("shutdown")
+async def on_shutdown():
+    runtime.record_engine.stop()
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(INDEX_HTML_PATH.read_text(encoding="utf-8"))
+
+
+@app.get("/recordings")
+async def list_recordings():
+    files = sorted(RECORDINGS_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return {"files": [f.name for f in files]}
 
 
 @app.get("/video_feed")
@@ -782,6 +1087,17 @@ async def video_feed():
 async def ws_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     await manager.send_to(websocket, {"type": "settings_snapshot", **settings_store.as_dict()})
+    await manager.send_to(websocket, {
+        "type": "recording_state",
+        "recording": runtime.record_engine.enabled,
+        "file": runtime.record_engine.filename,
+    })
+    await manager.send_to(websocket, {
+        "type": "mode",
+        "mode": runtime.mode,
+        "file": runtime.current_recording_file,
+        "ok": True,
+    })
     for line in list(log_history):
         await manager.send_to(websocket, line)
     for ev in list(event_history):
@@ -811,15 +1127,41 @@ async def ws_endpoint(websocket: WebSocket):
 
             elif command == "set_mode":
                 mode = msg.get("mode", "live")
+                file = msg.get("file")
+                ok = True
                 if mode == "replay":
-                    logger.warning("Replay mode requested — not implemented in Phase 1, staying live")
-                    mode = "live"
-                runtime.mode = mode
-                await manager.broadcast({"type": "mode", "mode": runtime.mode})
+                    if not file:
+                        logger.warning("set_mode 'replay' requires a 'file'")
+                        ok = False
+                    else:
+                        ok = switch_to_replay(file)
+                else:
+                    switch_to_live()
+                await manager.broadcast({
+                    "type": "mode",
+                    "mode": runtime.mode,
+                    "file": runtime.current_recording_file,
+                    "ok": ok,
+                })
+
+            elif command == "set_recording":
+                enabled = bool(msg.get("enabled", False))
+                if enabled and not runtime.record_engine.enabled:
+                    filename = runtime.record_engine.start()
+                    logger.info("Recording started -> %s", filename)
+                elif not enabled and runtime.record_engine.enabled:
+                    logger.info("Recording stopped -> %s", runtime.record_engine.filename)
+                    runtime.record_engine.stop()
+                await manager.broadcast({
+                    "type": "recording_state",
+                    "recording": runtime.record_engine.enabled,
+                    "file": runtime.record_engine.filename,
+                })
 
             elif command == "inject_demo_detection":
                 ev = fabricate_fused_event(sim=True)
                 event_history.append(ev)
+                record_if_active({"type": "event", **ev})
                 runtime.sim_badge_until = time.time() + 6.0
                 logger.info("Demo detection injected (SIM)")
                 await manager.broadcast({"type": "event", **ev})
