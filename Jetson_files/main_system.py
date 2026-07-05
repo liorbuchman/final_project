@@ -12,7 +12,8 @@ from enum import Enum
 
 # Resolve workspace paths for multi-modal submodule discovery
 script_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(script_dir)
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 
 import config
 from uav_acoustic.acoustic_processor import AcousticDetector
