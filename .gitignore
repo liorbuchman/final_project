@@ -1,0 +1,39 @@
+# Ignore all raw, processed data and models
+data/
+datasets/
+recordings/
+audio/
+sounds/
+models/
+results/
+
+# Media formats & Heavy Models
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.npy
+*.pt
+*.pth
+*.weights
+*.engine
+*.trt
+uav_vision/models/
+uav_acoustic/models/
+uav_acoustic/data/
+
+# System & Environment
+__pycache__/
+.vscode/
+.idea/
+*.log
+.env
+venv/
+drone_env/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# gui_dashboard runtime state
+gui_dashboard/config.json

@@ -1,0 +1,553 @@
+<title>UAV Multi-Modal Detection Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<style>
+  html, body { background:#0b0d10; color:#e5e7eb; height:100%; }
+  #root { min-height:100vh; }
+  .tabular-nums { font-variant-numeric: tabular-nums; }
+
+  @keyframes breathe { 0%,100%{opacity:.45} 50%{opacity:1} }
+  @keyframes blink2hz { 0%,49%{opacity:1} 50%,100%{opacity:.3} }
+  @keyframes pulseFast { 0%,100%{opacity:1; transform:scale(1)} 50%{opacity:.55; transform:scale(1.2)} }
+  @keyframes borderFlash { 0%,100%{ box-shadow: inset 0 0 0 7px rgba(239,68,68,.95); } 50%{ box-shadow: inset 0 0 0 7px rgba(239,68,68,0); } }
+
+  .led-idle { background:#6b7280; }
+  .led-searching { background:#3b82f6; animation: breathe 2s ease-in-out infinite; }
+  .led-slewing { background:#eab308; }
+  .led-tracking { background:#f97316; animation: blink2hz .5s steps(1,end) infinite; }
+  .led-engaged { background:#ef4444; animation: pulseFast .3s ease-in-out infinite; }
+  .led-degraded { background:#dc2626; }
+
+  .engaged-flash::after {
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:50;
+    animation: borderFlash .6s ease-in-out infinite;
+  }
+
+  .hc body, .hc { filter: contrast(1.25) brightness(1.15); }
+  .hc .bg-panel { background:#000 !important; border-color:#fff !important; }
+
+  .bg-panel { background:#14171c; border:1px solid #262b33; }
+  ::-webkit-scrollbar { width:8px; height:8px; }
+  ::-webkit-scrollbar-thumb { background:#3a4048; border-radius:4px; }
+
+  .spectro-canvas { image-rendering: pixelated; width:100%; height:160px; background:#000; }
+  .pending-ring { box-shadow: 0 0 0 2px #eab308 inset; }
+</style>
+
+<div id="root"></div>
+
+<script type="text/babel" data-presets="env,react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const STATE_COLORS = {
+  IDLE: "led-idle", SEARCHING: "led-searching", SLEWING: "led-slewing",
+  TRACKING: "led-tracking", ENGAGED: "led-engaged", DEGRADED: "led-degraded",
+};
+
+const SLIDER_DEFS = [
+  { key: "yolo_threshold", label: "YOLO Confidence Threshold", min: 0, max: 1, step: 0.01,
+    tip: "Minimum confidence score required for YOLOv8n to flag a visual bounding box as a drone." },
+  { key: "audio_threshold", label: "Acoustic CNN Threshold", min: 0, max: 1, step: 0.01,
+    tip: "Probability cutoff for the Audio CNN classifier to trigger an acoustic detection alarm." },
+  { key: "fusion_window_ms", label: "Sensor Fusion Window (ms)", min: 100, max: 2000, step: 10,
+    tip: "The time window in which visual and acoustic detections must overlap to trigger a combined system alarm." },
+  { key: "audio_gain", label: "Audio Gain / Pre-amp", min: 1, max: 10, step: 0.1,
+    tip: "Digital multiplier applied to raw audio streams before spectrogram generation." },
+  { key: "nms_threshold", label: "NMS Threshold", min: 0.1, max: 0.9, step: 0.01,
+    tip: "IoU overlap threshold for filtering duplicate YOLO bounding boxes on the same target." },
+  { key: "slew_timeout_s", label: "Slew Window Timeout (s)", min: 1.0, max: 5.0, step: 0.1,
+    tip: "The duration in seconds the system waits for mechanical stabilization of the PTZ camera before initiating YOLO tracking loop." },
+  { key: "lost_lock_timeout_s", label: "Lost Lock Timeout (s)", min: 1.0, max: 10.0, step: 0.1,
+    tip: "The time window the system tolerates an obscured visual track before declaring a false alarm and reverting to acoustic searching." },
+  { key: "audio_buffer_size", label: "Acoustic Buffer Frame Size", min: 128, max: 1024, step: 32,
+    tip: "Controls the length of the audio frame buffer used for generating the raw spectrogram before feeding it into the Acoustic CNN classifier." },
+];
+
+function beep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "square"; osc.frequency.value = 880;
+    gain.gain.value = 0.15;
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start();
+    setTimeout(() => { osc.stop(); ctx.close(); }, 250);
+  } catch (e) { /* audio not available */ }
+}
+
+function fmt(n, d = 1) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "N/A";
+  return Number(n).toFixed(d);
+}
+
+function App() {
+  const [connected, setConnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [settings, setSettings] = useState(null);
+  const [pending, setPending] = useState({});
+  const [telemetry, setTelemetry] = useState(null);
+  const [logs, setLogs] = useState([]);
+  const [events, setEvents] = useState([]);
+  const [debugMode, setDebugMode] = useState(true);
+  const [highContrast, setHighContrast] = useState(false);
+  const [alarmMuted, setAlarmMuted] = useState(false);
+  const [simActive, setSimActive] = useState(false);
+
+  const wsRef = useRef(null);
+  const backoffRef = useRef(1000);
+  const prevStateRef = useRef("IDLE");
+  const trailsRef = useRef([]); // {angle, kind, ts}
+  const radarCanvasRef = useRef(null);
+  const spectroCanvasRef = useRef(null);
+  const waveChartRef = useRef(null);
+  const waveCanvasRef = useRef(null);
+
+  const connect = useCallback(() => {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setConnected(true);
+      setReconnecting(false);
+      backoffRef.current = 1000;
+    };
+    ws.onclose = () => {
+      setConnected(false);
+      setReconnecting(true);
+      const delay = backoffRef.current;
+      backoffRef.current = Math.min(delay * 2, 10000);
+      setTimeout(connect, delay);
+    };
+    ws.onerror = () => { ws.close(); };
+    ws.onmessage = (evt) => {
+      const msg = JSON.parse(evt.data);
+      switch (msg.type) {
+        case "settings_snapshot":
+        case "settings_ack": {
+          const { type, ...rest } = msg;
+          setSettings(rest);
+          setPending({});
+          break;
+        }
+        case "telemetry": {
+          setTelemetry(msg);
+          setSimActive(!!msg.sim);
+          if (msg.state === "ENGAGED" && prevStateRef.current !== "ENGAGED" && !alarmMuted) beep();
+          prevStateRef.current = msg.state;
+          const now = Date.now() / 1000;
+          if (msg.vision && msg.vision.detections && msg.vision.detections.length) {
+            trailsRef.current.push({ angle: msg.vision.detections[0].azimuth_deg, kind: "visual", ts: now });
+          }
+          if (msg.acoustic && msg.acoustic.confidence >= (settingsRef.current?.audio_threshold ?? 0.7)) {
+            trailsRef.current.push({ angle: msg.acoustic.doa_deg, kind: "acoustic", ts: now });
+          }
+          trailsRef.current = trailsRef.current.filter(t => now - t.ts <= 3.0);
+          drawRadar(msg);
+          updateWaveform(msg.waveform);
+          break;
+        }
+        case "spectrogram":
+          drawSpectrogram(msg);
+          break;
+        case "log":
+          setLogs(prev => [...prev.slice(-49), msg]);
+          break;
+        case "event":
+          setEvents(prev => [msg, ...prev].slice(0, 100));
+          break;
+        case "mode":
+          break;
+        default:
+          break;
+      }
+    };
+  }, [alarmMuted]);
+
+  const settingsRef = useRef(null);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  useEffect(() => { connect(); }, [connect]);
+
+  useEffect(() => {
+    function resizeRadar() {
+      const canvas = radarCanvasRef.current;
+      if (!canvas) return;
+      const w = canvas.clientWidth || 560;
+      canvas.width = w;
+      canvas.height = Math.round(w * 0.5);
+    }
+    resizeRadar();
+    window.addEventListener("resize", resizeRadar);
+    return () => window.removeEventListener("resize", resizeRadar);
+  }, [debugMode]);
+
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === "p" || e.key === "P") {
+        if (!e.shiftKey) setDebugMode(v => !v);
+      }
+      if (e.shiftKey && (e.key === "D" || e.key === "d")) {
+        sendCommand({ command: "inject_demo_detection" });
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  function sendCommand(payload) {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(payload));
+    }
+  }
+
+  function updateSetting(key, value) {
+    setSettings(prev => ({ ...prev, [key]: value }));
+    setPending(prev => ({ ...prev, [key]: true }));
+    sendCommand({ command: "update_settings", [key]: value });
+  }
+
+  function toggleSystem() {
+    if (!settings) return;
+    updateSetting("system_active", !settings.system_active);
+  }
+
+  // ---------- Radar (Component D) ----------
+  function drawRadar(msg) {
+    const canvas = radarCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    const cx = W / 2, cy = H - 10;
+    const R = Math.min(W / 2 - 10, H - 30);
+
+    ctx.strokeStyle = "#2a2f38";
+    ctx.lineWidth = 1;
+    for (const frac of [0.33, 0.66, 1.0]) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, R * frac, Math.PI, 2 * Math.PI);
+      ctx.stroke();
+    }
+    // angle ticks
+    ctx.fillStyle = "#8b93a1";
+    ctx.font = "11px monospace";
+    for (const deg of [-90, -45, 0, 45, 90]) {
+      const rad = (deg - 90) * Math.PI / 180;
+      const x = cx + R * Math.cos(rad), y = cy + R * Math.sin(rad);
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y);
+      ctx.strokeStyle = "#20242c"; ctx.stroke();
+      ctx.fillText(`${deg}°`, x - 12, y - 4 * Math.sign(deg || 1) + (deg === 0 ? -6 : 0));
+    }
+    // camera FOV boundary (+/-45 deg = 90 total)
+    ctx.strokeStyle = "#3b82f6";
+    ctx.setLineDash([5, 4]);
+    for (const deg of [-45, 45]) {
+      const rad = (deg - 90) * Math.PI / 180;
+      ctx.beginPath(); ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + R * Math.cos(rad), cy + R * Math.sin(rad));
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    const toRad = deg => (deg - 90) * Math.PI / 180;
+    const state = msg.state;
+    const fused = state === "ENGAGED";
+
+    // acoustic DOA sector (30 deg wide = +/-15)
+    if (msg.acoustic && telemetryHasAudio(msg)) {
+      const doa = msg.acoustic.doa_deg;
+      const a0 = toRad(doa - 15), a1 = toRad(doa + 15);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, R * 0.9, a0, a1);
+      ctx.closePath();
+      ctx.fillStyle = fused ? "rgba(239,68,68,0.35)" : "rgba(56,189,248,0.28)";
+      ctx.fill();
+    }
+    // visual detection marker
+    if (msg.vision && msg.vision.detections && msg.vision.detections.length) {
+      const az = msg.vision.detections[0].azimuth_deg;
+      const rad = toRad(az);
+      const x = cx + R * 0.65 * Math.cos(rad), y = cy + R * 0.65 * Math.sin(rad);
+      ctx.beginPath();
+      ctx.arc(x, y, fused ? 8 : 5, 0, 2 * Math.PI);
+      ctx.fillStyle = fused ? "#ef4444" : "#22c55e";
+      if (fused) { ctx.shadowColor = "#ef4444"; ctx.shadowBlur = 18; }
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+    // trails, 3s alpha fade
+    const now = Date.now() / 1000;
+    for (const t of trailsRef.current) {
+      const age = now - t.ts;
+      const alpha = Math.max(0, 1 - age / 3.0) * 0.5;
+      const rad = toRad(t.angle);
+      const rr = t.kind === "visual" ? R * 0.65 : R * 0.9;
+      const x = cx + rr * Math.cos(rad), y = cy + rr * Math.sin(rad);
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, 2 * Math.PI);
+      ctx.fillStyle = t.kind === "visual" ? `rgba(34,197,94,${alpha})` : `rgba(56,189,248,${alpha})`;
+      ctx.fill();
+    }
+  }
+  function telemetryHasAudio(msg) { return msg.audio && msg.audio.active; }
+
+  // ---------- Spectrogram (Canvas ImageData, never Chart.js) ----------
+  function drawSpectrogram(msg) {
+    const canvas = spectroCanvasRef.current;
+    if (!canvas) return;
+    canvas.width = msg.cols; canvas.height = msg.rows;
+    const ctx = canvas.getContext("2d");
+    const bin = atob(msg.data);
+    const img = ctx.createImageData(msg.cols, msg.rows);
+    for (let i = 0; i < msg.rows * msg.cols; i++) {
+      const v = bin.charCodeAt(i);
+      img.data[i * 4 + 0] = v;
+      img.data[i * 4 + 1] = Math.min(255, v * 0.7);
+      img.data[i * 4 + 2] = 255 - v;
+      img.data[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  // ---------- Waveform (Chart.js, animation:false) ----------
+  useEffect(() => {
+    if (!waveCanvasRef.current) return;
+    waveChartRef.current = new Chart(waveCanvasRef.current.getContext("2d"), {
+      type: "line",
+      data: { labels: Array.from({ length: 128 }, (_, i) => i),
+        datasets: [{ data: [], borderColor: "#38bdf8", borderWidth: 1.5, pointRadius: 0, tension: 0.15 }] },
+      options: {
+        animation: false,
+        responsive: true, maintainAspectRatio: false,
+        scales: { x: { display: false }, y: { min: -1, max: 1, ticks: { color: "#6b7280" }, grid: { color: "#1f2430" } } },
+        plugins: { legend: { display: false } },
+      },
+    });
+  }, []);
+  function updateWaveform(waveform) {
+    const chart = waveChartRef.current;
+    if (!chart || !waveform) return;
+    chart.data.labels = waveform.map((_, i) => i);
+    chart.data.datasets[0].data = waveform;
+    chart.update("none");
+  }
+
+  function exportCSV() {
+    const header = "timestamp,modality,class,confidence,azimuth_deg\n";
+    const rows = events.map(e =>
+      `${new Date(e.ts * 1000).toISOString()},${e.modality},${e.cls},${e.confidence},${e.azimuth_deg}`
+    ).join("\n");
+    const blob = new Blob([header + rows], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "detection_events.csv";
+    a.click();
+  }
+
+  const state = telemetry?.state || "IDLE";
+  const latencyMs = telemetry ? ((Date.now() / 1000) - telemetry.sensor_ts) * 1000 : null;
+  const camera = telemetry?.camera || { connected: false, fps: 0 };
+  const audio = telemetry?.audio || { active: false, db: null };
+  const jetson = telemetry?.jetson || { cpu: null, gpu: null, temp_c: null };
+
+  return (
+    <div className={(highContrast ? "hc " : "") + (state === "ENGAGED" ? "engaged-flash " : "") + "min-h-screen p-3 gap-3 grid grid-cols-12"}>
+
+      {/* Component A: Header */}
+      <div className="col-span-12 bg-panel rounded-lg p-3 flex flex-wrap items-center gap-4">
+        <div className="flex items-center gap-2 pr-4 border-r border-gray-700">
+          <span className={`w-4 h-4 rounded-full inline-block ${STATE_COLORS[state]}`}></span>
+          <span className="font-bold tracking-wide">{state}</span>
+          {simActive && <span className="ml-2 text-xs bg-yellow-600 text-black px-2 py-0.5 rounded font-bold">SIM</span>}
+        </div>
+
+        <HeaderStat label="Camera" ok={camera.connected} okText={`Connected · ${fmt(camera.fps,1)} FPS`} badText="Disconnected" />
+        <HeaderStat label="Mic Array" ok={audio.active} okText={`Active · ${fmt(audio.db,1)} dB`} badText="Muted" />
+        <div className="text-sm">
+          <div className="text-gray-400 text-xs">Jetson</div>
+          <div className="tabular-nums">CPU {jetson.cpu ?? "N/A"}% · GPU {jetson.gpu ?? "N/A"}% · {jetson.temp_c ?? "N/A"}°C</div>
+        </div>
+        <div className="text-sm">
+          <div className="text-gray-400 text-xs">Link</div>
+          <div className={connected ? "text-green-400" : "text-red-400"}>{connected ? "Connected" : (reconnecting ? "Reconnecting…" : "Down")}</div>
+        </div>
+        <div className="text-sm">
+          <div className="text-gray-400 text-xs">End-to-End Latency</div>
+          <div className="tabular-nums">{latencyMs !== null ? `${fmt(latencyMs,0)} ms` : "N/A"}</div>
+        </div>
+
+        <div className="ml-auto flex items-center gap-2">
+          <button onClick={() => setAlarmMuted(v => !v)}
+            className={`px-3 py-1.5 rounded text-sm ${alarmMuted ? "bg-gray-700" : "bg-blue-700"}`}>
+            {alarmMuted ? "Alarm Muted" : "Alarm On"}
+          </button>
+          <button onClick={() => setHighContrast(v => !v)} className="px-3 py-1.5 rounded text-sm bg-gray-700" title="High-contrast mode for projector">
+            Contrast
+          </button>
+          <button disabled={!connected} onClick={toggleSystem}
+            className={`px-4 py-1.5 rounded font-bold text-sm ${settings?.system_active ? "bg-red-600" : "bg-green-600"} disabled:opacity-40`}>
+            {settings?.system_active ? "STOP" : "START"}
+          </button>
+        </div>
+      </div>
+
+      {state === "ENGAGED" && (
+        <div className="col-span-12 bg-red-700 text-white text-center py-1 rounded font-bold animate-pulse">
+          TARGET ENGAGED
+        </div>
+      )}
+      {state === "DEGRADED" && (
+        <div className="col-span-12 bg-red-900 border border-red-500 text-red-200 text-center py-1 rounded">
+          DEGRADED — hardware fault detected, attempting recovery
+        </div>
+      )}
+
+      {/* Component B: Video */}
+      <div className={debugMode ? "col-span-7" : "col-span-8"}>
+        <div className="bg-panel rounded-lg p-3 h-full flex flex-col">
+          <div className="flex justify-between items-center mb-2">
+            <h2 className="font-semibold text-sm text-gray-300">Vision Feed</h2>
+            <label className="text-xs flex items-center gap-1">
+              <input type="checkbox" checked={!!settings?.draw_boxes}
+                onChange={e => updateSetting("draw_boxes", e.target.checked)} />
+              Bounding Boxes
+            </label>
+          </div>
+          <div className="relative flex-1 bg-black rounded overflow-hidden" style={{ minHeight: debugMode ? 360 : 520 }}>
+            {camera.connected
+              ? <img src="/video_feed" className="w-full h-full object-contain" />
+              : <div className="absolute inset-0 flex items-center justify-center text-gray-500 font-mono text-2xl">NO SIGNAL</div>}
+          </div>
+          <div className="mt-2">
+            <div className="text-xs text-gray-400 mb-1">YOLO Confidence</div>
+            <div className="w-full bg-gray-800 rounded h-3">
+              <div className="bg-green-500 h-3 rounded tabular-nums" style={{ width: `${(telemetry?.vision?.confidence || 0) * 100}%` }}></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Component C: Audio */}
+      <div className={debugMode ? "col-span-5" : "col-span-4"}>
+        <div className="bg-panel rounded-lg p-3 h-full flex flex-col gap-3">
+          <h2 className="font-semibold text-sm text-gray-300">Audio Analytics & DSP</h2>
+          <div>
+            <div className="text-xs text-gray-400 mb-1">Audio CNN — Drone vs Background</div>
+            <div className="w-full bg-gray-800 rounded h-3 flex overflow-hidden">
+              <div className="bg-sky-500 h-3" style={{ width: `${(telemetry?.acoustic?.confidence || 0) * 100}%` }}></div>
+            </div>
+            <div className="text-xs tabular-nums text-gray-400 mt-1">{fmt((telemetry?.acoustic?.confidence||0)*100,0)}% drone</div>
+          </div>
+          {debugMode && (
+            <div>
+              <div className="text-xs text-gray-400 mb-1">Live Spectrogram</div>
+              <canvas ref={spectroCanvasRef} className="spectro-canvas rounded"></canvas>
+            </div>
+          )}
+          <div className="flex-1 min-h-[120px]">
+            <div className="text-xs text-gray-400 mb-1">Waveform</div>
+            <canvas ref={waveCanvasRef} height="120"></canvas>
+          </div>
+        </div>
+      </div>
+
+      {/* Component D: Radar */}
+      <div className={debugMode ? "col-span-6" : "col-span-8"}>
+        <div className="bg-panel rounded-lg p-3">
+          <h2 className="font-semibold text-sm text-gray-300 mb-2">Spatial Awareness Map</h2>
+          <canvas ref={radarCanvasRef} width="560" height="300" className="w-full"></canvas>
+        </div>
+      </div>
+
+      {/* Component E: Controls + Logs */}
+      {debugMode && (
+        <div className="col-span-6">
+          <div className="bg-panel rounded-lg p-3 flex flex-col gap-3 h-full">
+            <h2 className="font-semibold text-sm text-gray-300">Hyperparameter Control Panel</h2>
+            <div className="grid grid-cols-2 gap-3 overflow-y-auto" style={{ maxHeight: 220 }}>
+              {SLIDER_DEFS.map(def => (
+                <div key={def.key} title={def.tip} className={pending[def.key] ? "pending-ring rounded p-1" : "p-1"}>
+                  <div className="text-xs text-gray-400 flex justify-between">
+                    <span>{def.label}</span>
+                    <span className="tabular-nums">{settings ? settings[def.key] : "--"}</span>
+                  </div>
+                  <input type="range" min={def.min} max={def.max} step={def.step}
+                    disabled={!connected}
+                    value={settings ? settings[def.key] : def.min}
+                    onChange={e => updateSetting(def.key, parseFloat(e.target.value))}
+                    className="w-full" />
+                </div>
+              ))}
+              <div title="Inverts the camera pan/tilt axes to dynamically compensate for the upside-down physical installation of the PTZ housing on the tactical rig."
+                className={"p-1 flex items-center gap-2 " + (pending.invert_camera_vector ? "pending-ring rounded" : "")}>
+                <input type="checkbox" disabled={!connected} checked={!!settings?.invert_camera_vector}
+                  onChange={e => updateSetting("invert_camera_vector", e.target.checked)} />
+                <span className="text-xs text-gray-300">Invert PTZ Camera Vector</span>
+              </div>
+            </div>
+
+            <h2 className="font-semibold text-sm text-gray-300 mt-2">Live System Log</h2>
+            <div className="bg-black rounded p-2 font-mono text-xs flex-1 overflow-y-auto" style={{ minHeight: 140 }}>
+              {logs.map((l, i) => (
+                <div key={i} className={
+                  l.level === "ERROR" ? "text-red-400" : l.level === "WARNING" ? "text-yellow-400" : "text-gray-400"
+                }>
+                  [{new Date(l.ts * 1000).toLocaleTimeString()}] {l.level}: {l.msg}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Component F: Detection Event History */}
+      {debugMode && (
+        <div className="col-span-12">
+          <div className="bg-panel rounded-lg p-3">
+            <div className="flex justify-between items-center mb-2">
+              <h2 className="font-semibold text-sm text-gray-300">Detection Event History</h2>
+              <button onClick={exportCSV} className="text-xs bg-gray-700 px-3 py-1 rounded">Export CSV</button>
+            </div>
+            <div className="overflow-y-auto" style={{ maxHeight: 200 }}>
+              <table className="w-full text-xs">
+                <thead className="text-gray-400 text-left">
+                  <tr><th className="p-1">Timestamp</th><th>Modality</th><th>Class</th><th>Confidence</th><th>Azimuth</th></tr>
+                </thead>
+                <tbody>
+                  {events.map((e, i) => (
+                    <tr key={i} className={e.modality === "Fused" ? "bg-red-950/50" : ""}>
+                      <td className="p-1 tabular-nums">{new Date(e.ts * 1000).toLocaleTimeString()}</td>
+                      <td>{e.modality}{e.sim ? " (SIM)" : ""}</td>
+                      <td>{e.cls}</td>
+                      <td className="tabular-nums">{fmt(e.confidence,2)}</td>
+                      <td className="tabular-nums">{fmt(e.azimuth_deg,1)}°</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HeaderStat({ label, ok, okText, badText }) {
+  return (
+    <div className="text-sm">
+      <div className="text-gray-400 text-xs">{label}</div>
+      <div className={ok ? "text-green-400" : "text-red-400"}>{ok ? okText : badText}</div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>

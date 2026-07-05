@@ -1,0 +1,38 @@
+name: drone_env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - scikit-learn
+  - jupyterlab
+
+  - pytorch
+  - torchvision
+  - torchaudio
+  - cpuonly
+
+  - numba
+  - tqdm
+  - pyqt
+  - pyaudio
+  - pip
+
+  - pip:
+      - opencv-python
+      - ultralytics
+      - librosa
+      - sounddevice
+      - soundfile
+      - pyqtgraph
+      - mediapipe
+      - onvif-zeep
+      - wsdiscovery
+      - requests   
+      - pyusb

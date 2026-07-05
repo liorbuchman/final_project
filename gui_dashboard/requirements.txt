@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+psutil
+opencv-python
+numpy
+
+# On the real Jetson target only (not available/needed on dev machines):
+# jetson-stats

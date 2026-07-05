@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kill 294)",
+      "Bash(rm -f server.log config.json)",
+      "Bash(rm -rf /c/final_project/gui_dashboard/__pycache__)",
+      "Bash(npx --version)",
+      "Bash(python -c \"import playwright\")",
+      "Bash(python -c \"import selenium\")",
+      "Bash(python -m pip install playwright)"
+    ],
+    "additionalDirectories": [
+      "C:\\final_project\\gui_dashboard\\__pycache__"
+    ]
+  }
+}
