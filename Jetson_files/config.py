@@ -15,6 +15,8 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 YOLO_CONF_THRESHOLD = 0.6
 MOVE_SPEED = 0.2
+PAN_MIN, PAN_MAX = -170.0, 170.0
+TILT_MIN, TILT_MAX = -90.0, 30.0
 
 # --- Acoustic Settings ---
 AUDIO_MODEL_DIR = os.path.join(BASE_DIR, "uav_acoustic")
@@ -28,6 +30,10 @@ SMOOTHING_WINDOW = 1
 # --- FSM Tactical Timeouts ---
 TARGET_LOST_TIMEOUT = 5.0
 DEFAULT_ELEVATION_ANGLE = -90
+VISUAL_LOCK_COOLDOWN = 1.5
+KP_PAN = 0.0015
+KP_TILT = -0.0015
+TILT_DIRECTION_INVERSION = -1.0 # check if needed
 
 # --- Hardware-Accelerated GStreamer Pipeline---
 def get_gstreamer_pipeline():

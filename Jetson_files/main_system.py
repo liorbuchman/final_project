@@ -149,9 +149,9 @@ class IntegratedDroneDefenseSystem:
                 )
                 with self.data_lock:
                     self.acoustic_hw_status = "ONLINE"
-                logging.info(f"🎤 [AUDIO HOT] Direct connection bound to audio node at Index {target_idx} using {target_channels} channels.")
+                logging.info(f"[AUDIO HOT] Direct connection bound to audio node at Index {target_idx} using {target_channels} channels.")
             except Exception as e:
-                logging.error(f"❌ [Acoustic HW] PyAudio hardware streaming link rejected: {e}")
+                logging.error(f"[Acoustic HW] PyAudio hardware streaming link rejected: {e}")
                 with self.data_lock:
                     self.acoustic_hw_status = "UNAVAILABLE"
 
@@ -205,6 +205,11 @@ class IntegratedDroneDefenseSystem:
     def tactical_fsm_loop(self):
         """Independent asynchronous loop dedicated entirely to tactical state management (10Hz)."""
         logging.info("[Subsystem] Tactical FSM thread deployed and decoupled from frame-rate.")
+        
+        # Track frame drop timestamps to smooth out visual flickering
+        last_seen_visual_time = time.time()
+        deterrent_active = False
+
         while self.running:
             curr_time = time.time()
 
@@ -219,43 +224,59 @@ class IntegratedDroneDefenseSystem:
 
             if self.state == SystemState.SCANNING:
                 if audio_alert:
-                    logging.info(f"[FSM TRANSITION] SCANNING -> SLEWING. Vector: {target_azimuth}°")
-                    self.state = SystemState.SLEWING
-                    self.state_timestamp = curr_time
-                    # Safe Driver Check: Only dispatch PTZ commands if camera layer is authenticated online
-                    if cam_status == "ONLINE":
-                        self.video_processor.track_target(target_azimuth, config.DEFAULT_ELEVATION_ANGLE)
-
-            elif self.state == SystemState.SLEWING:
-                if video_lock:
-                    logging.info("[FSM TRANSITION] SLEWING -> ENGAGED. Dynamic visual intercept achieved.")
-                    self.state = SystemState.ENGAGED
-                elif curr_time - self.state_timestamp > 2.0:
-                    logging.info("[FSM TRANSITION] SLEWING -> TRACKING. Transit complete. Arresting payloads.")
-                    if cam_status == "ONLINE":
-                        self.video_processor.track_target(0, 0)
+                    logging.info(f"[FSM TRANSITION] SCANNING -> TRACKING. Acoustic vector captured: {target_azimuth}°")
                     self.state = SystemState.TRACKING
                     self.state_timestamp = curr_time
 
             elif self.state == SystemState.TRACKING:
                 if video_lock:
-                    logging.info("[FSM TRANSITION] TRACKING -> ENGAGED. YOLO target confirmation acquired.")
+                    logging.info("[FSM TRANSITION] TRACKING -> ENGAGED. YOLO visual lock confirmed.")
                     self.state = SystemState.ENGAGED
+                    last_seen_visual_time = curr_time
                     if cam_status == "ONLINE":
+                        self.video_processor.track_target(0, 0) # Instant motor arrest on contact
                         self.video_processor.trigger_deterrent(True)
+                        deterrent_active = True
+                elif audio_alert:
+                    # Continuous Acoustic Tracking using the P-Controller
+                    if cam_status == "ONLINE":
+                        self.video_processor.slew_to_acoustic_azimuth(target_azimuth)
+                    self.state_timestamp = curr_time 
                 elif curr_time - self.state_timestamp > config.TARGET_LOST_TIMEOUT:
                     logging.info("[FSM TRANSITION] TRACKING -> SCANNING. Search window expired. Resetting grid.")
+                    if cam_status == "ONLINE":
+                        self.video_processor.track_target(0, 0)
                     self.state = SystemState.SCANNING
 
             elif self.state == SystemState.ENGAGED:
-                if not video_lock:
-                    logging.info("[FSM TRANSITION] ENGAGED -> TRACKING. Target trace lost. Dropping payloads.")
-                    self.state = SystemState.TRACKING
-                    self.state_timestamp = curr_time
+                if video_lock:
+                    # Target is visible - update the confirmation timestamp
+                    last_seen_visual_time = curr_time
+                    if not deterrent_active and cam_status == "ONLINE":
+                        self.video_processor.trigger_deterrent(True)
+                        deterrent_active = True
+                        
+                    # Dispatch Visual Closed-Loop tracking velocities during target contact
                     if cam_status == "ONLINE":
-                        self.video_processor.trigger_deterrent(False)
+                        self.video_processor.execute_visual_closed_loop()
+                else:
+                    # YOLO lost the target for this frame. Check if the hysteresis window has expired.
+                    time_since_last_sight = curr_time - last_seen_visual_time
+                    
+                    if time_since_last_sight > config.VISUAL_LOCK_COOLDOWN:
+                        logging.info(f"[FSM TRANSITION] ENGAGED -> TRACKING. Target lost for {time_since_last_sight:.1f}s. Dropping payloads.")
+                        self.state = SystemState.TRACKING
+                        self.state_timestamp = curr_time
+                        if cam_status == "ONLINE":
+                            self.video_processor.track_target(0, 0)
+                            self.video_processor.trigger_deterrent(False)
+                            deterrent_active = False
+                    else:
+                        #Hysteresis Cooldown Buffer Active.
+                        # Keep camera moving at last calculated speed or slow decay to hold target vector
+                        pass
 
-            time.sleep(0.1)
+            time.sleep(0.1) # Limits tactical logic processing overhead to a stable 10Hz
 
     def optical_master_loop(self):
         """High-throughput GStreamer video capture loop running on native execution thread."""
