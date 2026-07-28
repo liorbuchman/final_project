@@ -22,9 +22,8 @@ from uav_vision.optical_processor import OpticalDetector
 
 class SystemState(Enum):
     SCANNING = 1
-    SLEWING = 2
-    TRACKING = 3
-    ENGAGED = 4
+    TRACKING = 2
+    ENGAGED = 3
 
 
 class IntegratedDroneDefenseSystem:
@@ -58,7 +57,6 @@ class IntegratedDroneDefenseSystem:
         log_file_name = f"integrated_system_{current_time}.log"
         log_file_path = os.path.join(optical_logs_dir, log_file_name)
 
-        # Force dynamic file handler to bypass any internal logging set by YOLO/Ultralytics
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s [%(levelname)s] %(message)s',
@@ -69,13 +67,11 @@ class IntegratedDroneDefenseSystem:
 
     def start_defense_grid(self):
         """Initializes hardware contexts and spawns concurrent subsystem loops."""
-        # 1. Initialize synchronous logging configurations
         self.init_logging()
 
-        # 2. Safely attempt validation of sub-module asset layers
         try:
             self.audio_processor.load_model()
-            if self.audio_processor.usb_dev is None:
+            if getattr(self.audio_processor, 'usb_dev', None) is None:
                 self.acoustic_hw_status = "UNAVAILABLE"
         except Exception as audio_err:
             logging.error(f"Acoustic core initial load failure: {audio_err}")
@@ -83,21 +79,20 @@ class IntegratedDroneDefenseSystem:
 
         try:
             self.video_processor.initialize_hardware()
-            if self.video_processor.ptz is None:
+            if getattr(self.video_processor, 'ptz', None) is None:
                 self.optical_hw_status = "UNAVAILABLE"
         except Exception as video_err:
             logging.error(f"Optical ONVIF driver initial load failure: {video_err}")
             self.optical_hw_status = "UNAVAILABLE"
 
-        # 3. Spawn independent thread for background acoustic array processing
+        # Spawn independent background threads
         audio_thread = threading.Thread(target=self.acoustic_background_loop, daemon=True, name="AcousticThread")
         audio_thread.start()
 
-        # 4. Spawn independent thread for the tactical FSM (Decoupled from video frame rate)
         fsm_thread = threading.Thread(target=self.tactical_fsm_loop, daemon=True, name="FSMThread")
         fsm_thread.start()
 
-        # 5. Bind master loop directly into the main thread video channel
+        # Run optical pipeline on the main thread
         self.optical_master_loop()
 
     def acoustic_background_loop(self):
@@ -110,9 +105,8 @@ class IntegratedDroneDefenseSystem:
         p = pyaudio.PyAudio()
         stream = None
         
-        # --- HARDWARE AUTO-DISCOVERY BLOCK (Fixed for native 6-channel XMOS stream) ---
         target_idx = None
-        target_channels = 6 # Standard native channel width for ReSpeaker USB firmware (4 Mics + 2 Loopback)
+        target_channels = 6
         
         logging.info("[Acoustic HW] Scanning active system audio interfaces...")
         for i in range(p.get_device_count()):
@@ -121,10 +115,8 @@ class IntegratedDroneDefenseSystem:
                 dev_name = dev_info.get("name", "")
                 max_inputs = dev_info.get("maxInputChannels", 0)
                 
-                # Check if this hardware node matches our ReSpeaker chipset
                 if "ReSpeaker" in dev_name or "seeed" in dev_name.lower():
                     target_idx = i
-                    # CRITICAL FIX: Mandate native hardware channel size (6) to satisfy ALSA constraints
                     target_channels = max_inputs if max_inputs > 0 else 6
                     logging.info(f"🎤 [FOUND] Device '{dev_name}' bound at Index {target_idx} (Native Channels: {max_inputs})")
                     break
@@ -132,67 +124,58 @@ class IntegratedDroneDefenseSystem:
                 logging.debug(f"Skipping audio node index {i}: {scan_err}")
 
         if target_idx is None:
-            logging.warning(f"⚠️ [Acoustic HW] ReSpeaker not found by name. Falling back to config default index ({config.RESPEAKER_INDEX}).")
+            logging.warning(f"⚠️ [Acoustic HW] ReSpeaker not found by name. Falling back to default index ({config.RESPEAKER_INDEX}).")
             target_idx = config.RESPEAKER_INDEX
 
-        # Guard initialization check before attempting to lock local USB soundcard descriptors
-        if self.acoustic_hw_status != "UNAVAILABLE":
-            try:
-                # Open live streaming channel using the exact native hardware channel count
-                stream = p.open(
-                    format=pyaudio.paInt16,
-                    channels=target_channels,
-                    rate=config.SAMPLE_RATE,
-                    input=True,
-                    input_device_index=target_idx,
-                    frames_per_buffer=chunk_size
-                )
-                with self.data_lock:
-                    self.acoustic_hw_status = "ONLINE"
-                logging.info(f"[AUDIO HOT] Direct connection bound to audio node at Index {target_idx} using {target_channels} channels.")
-            except Exception as e:
-                logging.error(f"[Acoustic HW] PyAudio hardware streaming link rejected: {e}")
-                with self.data_lock:
-                    self.acoustic_hw_status = "UNAVAILABLE"
-
         while self.running:
+            # Attempt reconnection if stream is inactive
+            if stream is None and self.acoustic_hw_status != "UNAVAILABLE":
+                try:
+                    stream = p.open(
+                        format=pyaudio.paInt16,
+                        channels=target_channels,
+                        rate=config.SAMPLE_RATE,
+                        input=True,
+                        input_device_index=target_idx,
+                        frames_per_buffer=chunk_size
+                    )
+                    with self.data_lock:
+                        self.acoustic_hw_status = "ONLINE"
+                    logging.info(f"[AUDIO HOT] Connection bound to index {target_idx}.")
+                except Exception as e:
+                    logging.error(f"[Acoustic HW] Stream connection failed: {e}")
+                    with self.data_lock:
+                        self.acoustic_hw_status = "UNAVAILABLE"
+
             with self.data_lock:
                 is_hw_active = (self.acoustic_hw_status == "ONLINE")
 
             if is_hw_active and stream is not None:
                 try:
                     raw_bytes = stream.read(chunk_size, exception_on_overflow=False)
-                    # Dynamic matrix reshape based on native target channel geometry
                     audio_chunk = np.frombuffer(raw_bytes, dtype=np.int16).reshape(-1, target_channels)
-                    
-                    # Forward structured multi-channel array matrix directly to the CNN core pipeline
-                    # acoustic_processor pulls index 0 ([:, 0]) smoothly without any index bounding problems
                     self.audio_processor.process_audio_buffer(audio_chunk)
 
                     with self.data_lock:
                         self.acoustic_triggered = self.audio_processor.is_triggered
                         self.acoustic_azimuth = self.audio_processor.current_azimuth
                 except Exception as loop_err:
-                    logging.error(f"[Acoustic Loop Fault] Telemetry acquisition failure: {loop_err}")
+                    logging.error(f"[Acoustic Loop Fault] Hardware read error: {loop_err}")
+                    if stream:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        stream = None
                     with self.data_lock:
                         self.acoustic_hw_status = "UNAVAILABLE"
                     time.sleep(config.STEP_SECS)
             else:
-                # Safe Fallback Cadence: Maintain system loops without hardware starvation crashes
                 with self.data_lock:
                     self.acoustic_triggered = False
-                    self.acoustic_hw_status = "UNAVAILABLE"
                 time.sleep(1.0)
 
-        if stream is not None:
-            try:
-                stream.stop_stream()
-                stream.close()
-            except Exception:
-                pass
-        p.terminate()
-        logging.info("[Subsystem] Live acoustic streaming interface safely terminated.")
-
+        # Cleanup block (Single, clean termination)
         if stream is not None:
             try:
                 stream.stop_stream()
@@ -204,82 +187,66 @@ class IntegratedDroneDefenseSystem:
 
     def tactical_fsm_loop(self):
         """Independent asynchronous loop dedicated entirely to tactical state management (10Hz)."""
-        logging.info("[Subsystem] Tactical FSM thread deployed and decoupled from frame-rate.")
-        
-        # Track frame drop timestamps to smooth out visual flickering
+        logging.info("[Subsystem] Tactical FSM thread deployed.")
         last_seen_visual_time = time.time()
-        deterrent_active = False
 
         while self.running:
             curr_time = time.time()
 
-            # Thread-safe read snapshot of cross-sensor parameters
             with self.data_lock:
                 audio_alert = self.acoustic_triggered
                 target_azimuth = self.acoustic_azimuth
                 video_lock = self.visual_lock_acquired
                 cam_status = self.optical_hw_status
+                current_state = self.state
 
-            # --- Finite State Machine State Evaluations ---
-
-            if self.state == SystemState.SCANNING:
+            # --- Finite State Machine ---
+            if current_state == SystemState.SCANNING:
                 if audio_alert:
-                    logging.info(f"[FSM TRANSITION] SCANNING -> TRACKING. Acoustic vector captured: {target_azimuth}°")
-                    self.state = SystemState.TRACKING
-                    self.state_timestamp = curr_time
+                    logging.info(f"[FSM TRANSITION] SCANNING -> TRACKING. Acoustic vector: {target_azimuth}°")
+                    with self.data_lock:
+                        self.state = SystemState.TRACKING
+                        self.state_timestamp = curr_time
 
-            elif self.state == SystemState.TRACKING:
+            elif current_state == SystemState.TRACKING:
                 if video_lock:
                     logging.info("[FSM TRANSITION] TRACKING -> ENGAGED. YOLO visual lock confirmed.")
-                    self.state = SystemState.ENGAGED
+                    with self.data_lock:
+                        self.state = SystemState.ENGAGED
                     last_seen_visual_time = curr_time
-                    if cam_status == "ONLINE":
-                        self.video_processor.track_target(0, 0) # Instant motor arrest on contact
-                        self.video_processor.trigger_deterrent(True)
-                        deterrent_active = True
-                elif audio_alert:
-                    # Continuous Acoustic Tracking using the P-Controller
-                    if cam_status == "ONLINE":
-                        self.video_processor.slew_to_acoustic_azimuth(target_azimuth)
-                    self.state_timestamp = curr_time 
-                elif curr_time - self.state_timestamp > config.TARGET_LOST_TIMEOUT:
-                    logging.info("[FSM TRANSITION] TRACKING -> SCANNING. Search window expired. Resetting grid.")
                     if cam_status == "ONLINE":
                         self.video_processor.track_target(0, 0)
-                    self.state = SystemState.SCANNING
+                elif audio_alert:
+                    if cam_status == "ONLINE" and hasattr(self.video_processor, 'handle_acoustic_search'):
+                        self.video_processor.handle_acoustic_search(target_azimuth)
+                    with self.data_lock:
+                        self.state_timestamp = curr_time 
+                elif curr_time - self.state_timestamp > config.TARGET_LOST_TIMEOUT:
+                    logging.info("[FSM TRANSITION] TRACKING -> SCANNING. Search window expired.")
+                    if cam_status == "ONLINE":
+                        self.video_processor.track_target(0, 0)
+                    with self.data_lock:
+                        self.state = SystemState.SCANNING
 
-            elif self.state == SystemState.ENGAGED:
+            elif current_state == SystemState.ENGAGED:
                 if video_lock:
-                    # Target is visible - update the confirmation timestamp
                     last_seen_visual_time = curr_time
-                    if not deterrent_active and cam_status == "ONLINE":
-                        self.video_processor.trigger_deterrent(True)
-                        deterrent_active = True
-                        
-                    # Dispatch Visual Closed-Loop tracking velocities during target contact
                     if cam_status == "ONLINE":
                         self.video_processor.execute_visual_closed_loop()
                 else:
-                    # YOLO lost the target for this frame. Check if the hysteresis window has expired.
                     time_since_last_sight = curr_time - last_seen_visual_time
-                    
                     if time_since_last_sight > config.VISUAL_LOCK_COOLDOWN:
-                        logging.info(f"[FSM TRANSITION] ENGAGED -> TRACKING. Target lost for {time_since_last_sight:.1f}s. Dropping payloads.")
-                        self.state = SystemState.TRACKING
-                        self.state_timestamp = curr_time
+                        logging.info(f"[FSM TRANSITION] ENGAGED -> TRACKING. Target lost for {time_since_last_sight:.1f}s.")
+                        with self.data_lock:
+                            self.state = SystemState.TRACKING
+                            self.state_timestamp = curr_time
                         if cam_status == "ONLINE":
                             self.video_processor.track_target(0, 0)
-                            self.video_processor.trigger_deterrent(False)
-                            deterrent_active = False
-                    else:
-                        #Hysteresis Cooldown Buffer Active.
-                        # Keep camera moving at last calculated speed or slow decay to hold target vector
-                        pass
 
-            time.sleep(0.1) # Limits tactical logic processing overhead to a stable 10Hz
+            time.sleep(0.1)
 
     def optical_master_loop(self):
-        """High-throughput GStreamer video capture loop running on native execution thread."""
+        """High-throughput video capture loop running on native execution thread."""
         import numpy as np
         
         pipeline_string = config.get_gstreamer_pipeline()
@@ -289,7 +256,7 @@ class IntegratedDroneDefenseSystem:
             is_cam_driver_ok = (self.optical_hw_status != "UNAVAILABLE")
 
         if not cap.isOpened() or not is_cam_driver_ok:
-            logging.critical("Failed to instantiate hardware accelerated GStreamer pipeline or ONVIF node.")
+            logging.critical("Failed to instantiate GStreamer pipeline or ONVIF node.")
             with self.data_lock:
                 self.optical_hw_status = "UNAVAILABLE"
         else:
@@ -304,15 +271,15 @@ class IntegratedDroneDefenseSystem:
 
             with self.data_lock:
                 is_video_feed_active = (self.optical_hw_status == "ONLINE")
+                current_state = self.state
 
-            # Try to grab frame matrix only if pipeline is confirmed healthy
             if is_video_feed_active and cap.isOpened():
                 try:
                     ret, frame = cap.read()
                     if ret:
                         frame_fetched = True
                     else:
-                        logging.warning("Hardware digital video stream link dropped frames unexpectedly.")
+                        logging.warning("Video stream dropped frames.")
                         with self.data_lock:
                             self.optical_hw_status = "UNAVAILABLE"
                 except Exception as stream_err:
@@ -321,51 +288,45 @@ class IntegratedDroneDefenseSystem:
                         self.optical_hw_status = "UNAVAILABLE"
 
             if frame_fetched and frame is not None:
-                # Spatial correction mapping for inverted physical camera positioning
                 frame = cv2.flip(frame, -1)
-                
-                # Scale frame matrix to 640x480 BEFORE inference to resolve Domain Shift pixel soup
-                inference_frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
+                inference_frame = cv2.resize(frame, (config.FRAME_WIDTH, config.FRAME_HEIGHT), interpolation=cv2.INTER_LINEAR)
 
-                # Compute convolutional YOLO inference matching current tactical requirements
-                if self.state in [SystemState.SLEWING, SystemState.TRACKING, SystemState.ENGAGED]:
+                if current_state in [SystemState.TRACKING, SystemState.ENGAGED]:
                     inference_frame = self.video_processor.run_inference(inference_frame)
 
                 with self.data_lock:
                     self.visual_lock_acquired = self.video_processor.visual_lock
             else:
-                # FALLBACK SAFE VIEWPORT: Create localized safe blank matrix canvas to prevent rendering freeze
-                inference_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                inference_frame = np.zeros((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8)
                 cv2.putText(inference_frame, "VIDEO SIGNAL: UNAVAILABLE", (80, 250),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
                 with self.data_lock:
                     self.visual_lock_acquired = False
 
-            # Thread-safe telemetry snapshot for tactical UI HUD rendering
             with self.data_lock:
                 current_state_name = self.state.name
                 mic_status = self.acoustic_hw_status
                 cam_status = self.optical_hw_status
 
-            # Dynamic Banner Generation: Shift background to red warning zone if assets are lost
-            banner_color = (0, 0, 0) # Neutral Black
+            banner_color = (0, 0, 0)
             if mic_status == "UNAVAILABLE" or cam_status == "UNAVAILABLE":
-                banner_color = (0, 0, 160) # High-Visibility Tactical Red Warning
+                banner_color = (0, 0, 160)
 
-            # Construct Integrated UI Telemetry Overlay on the display frame buffer
             overlay_text = f"FSM: {current_state_name} | MIC: {mic_status} | CAM: {cam_status}"
             cv2.rectangle(inference_frame, (0, 0), (inference_frame.shape[1], 40), banner_color, -1)
             cv2.putText(inference_frame, overlay_text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
-            # Display structural frame matrix directly to monitor layout window
-            cv2.imshow("Tactical Multi-Modal Interceptor Grid", inference_frame)
+            # Safe GUI display catch for headless environments
+            try:
+                cv2.imshow("Tactical Multi-Modal Interceptor Grid", inference_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    logging.info("[Main] Termination requested via keyboard interrupt.")
+                    self.running = False
+                    break
+            except cv2.error as gui_err:
+                # Log once or skip GUI rendering if no display is available
+                pass
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                logging.info("[Main] Termination sequence requested via keyboard interrupt.")
-                self.running = False
-                break
-
-        # Graceful hardware destruction sequence
         logging.info("Arresting PTZ physical payloads and freeing context links.")
         with self.data_lock:
             can_shutdown_motors = (self.optical_hw_status == "ONLINE")
@@ -375,7 +336,10 @@ class IntegratedDroneDefenseSystem:
             except Exception:
                 pass
         cap.release()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
