@@ -22,6 +22,7 @@ results/
 uav_vision/models/
 uav_acoustic/models/
 uav_acoustic/data/
+uav_vision/src/recorded_drones/
 
 # System & Environment
 __pycache__/
