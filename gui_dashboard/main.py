@@ -16,6 +16,7 @@ import base64
 import json
 import logging
 import math
+import os
 import random
 import time
 from collections import deque
@@ -27,6 +28,8 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse
+
+import hardware_bridge
 
 try:
     import psutil
@@ -736,6 +739,8 @@ class RuntimeState:
     live_audio: Optional[AudioPipeline] = None
     replay_vision: Optional[ReplayVisionPipeline] = None
     replay_audio: Optional[ReplayAudioPipeline] = None
+    hw_vision: Optional[VisionPipeline] = None
+    hw_audio: Optional[AudioPipeline] = None
     mjpeg_clients: int = 0
     latest_jpeg: Optional[bytes] = None
     mode: str = "live"
@@ -745,6 +750,7 @@ class RuntimeState:
     prev_acoustic_hit: bool = False
     prev_state: str = "IDLE"
     record_engine: RecordEngine = field(init=False)
+    hardware_active: bool = False
 
     def __post_init__(self):
         self.live_vision = self.vision
@@ -756,7 +762,7 @@ runtime = RuntimeState()
 
 
 def record_if_active(payload: dict):
-    if settings_store.system_active:
+    if runtime.hardware_active or settings_store.system_active:
         runtime.record_engine.write(payload)
 
 
@@ -807,7 +813,7 @@ async def video_encode_loop():
     interval = 1.0 / VIDEO_FPS
     while True:
         try:
-            if runtime.mjpeg_clients > 0 and settings_store.system_active:
+            if runtime.mjpeg_clients > 0 and (runtime.hardware_active or settings_store.system_active):
                 frame = runtime.vision.latest_frame()
                 if frame is not None:
                     runtime.latest_jpeg = frame
@@ -839,22 +845,28 @@ async def telemetry_loop():
     while True:
         try:
             now = time.time()
-            active = settings_store.system_active
+            active = runtime.hardware_active or settings_store.system_active
             vision_result = runtime.vision.latest_result() if active else None
             audio_result = runtime.audio.latest_result() if active else None
 
-            camera_ok = (not active) or runtime.vision.connected
-            mic_ok = (not active) or runtime.audio.active
-
-            state = runtime.fsm.tick(
-                now=now,
-                system_active=active,
-                vision=vision_result,
-                audio=audio_result,
-                settings=settings_store.as_dict(),
-                camera_ok=camera_ok,
-                mic_ok=mic_ok,
-            )
+            if runtime.hardware_active:
+                # The live IntegratedDroneDefenseSystem owns the authoritative FSM;
+                # mirror it instead of recomputing state from simulated thresholds.
+                state = hardware_bridge.get_fsm_state()
+                camera_ok = hardware_bridge.get_camera_ok()
+                mic_ok = hardware_bridge.get_mic_ok()
+            else:
+                camera_ok = (not active) or runtime.vision.connected
+                mic_ok = (not active) or runtime.audio.active
+                state = runtime.fsm.tick(
+                    now=now,
+                    system_active=active,
+                    vision=vision_result,
+                    audio=audio_result,
+                    settings=settings_store.as_dict(),
+                    camera_ok=camera_ok,
+                    mic_ok=mic_ok,
+                )
 
             if state != runtime.prev_state:
                 logger.info("State transition: %s -> %s", runtime.prev_state, state)
@@ -925,7 +937,7 @@ async def spectrogram_loop():
     interval = 1.0 / SPECTROGRAM_HZ
     while True:
         try:
-            if settings_store.system_active:
+            if runtime.hardware_active or settings_store.system_active:
                 audio_result = runtime.audio.latest_result()
                 if audio_result is not None:
                     spec = audio_result.spectrogram
@@ -1035,15 +1047,34 @@ async def on_startup():
     handler.setLevel(logging.INFO)
     logger.addHandler(handler)
 
-    if settings_store.system_active:
-        runtime.vision.start()
-        runtime.audio.start()
+    if os.environ.get("HARDWARE_MODE") == "1":
+        if hardware_bridge.activate():
+            runtime.hardware_active = True
+            runtime.hw_vision = hardware_bridge.HardwareVisionPipeline(VisionResult, VisionDetection)
+            runtime.hw_audio = hardware_bridge.HardwareAudioPipeline(AudioResult)
+            runtime.live_vision = runtime.hw_vision
+            runtime.live_audio = runtime.hw_audio
+            runtime.vision = runtime.hw_vision
+            runtime.audio = runtime.hw_audio
+        else:
+            logger.warning("HARDWARE_MODE=1 requested but the hardware bridge failed to activate — staying simulated")
+
+    if runtime.hardware_active:
+        # The live defense grid runs continuously from here on regardless of the
+        # GUI's START/STOP switch (that switch only controls replay playback) —
+        # just push the persisted threshold settings into the real system once.
         apply_pipeline_params()
+        logger.info("Dashboard backend started (hardware bridge — live IntegratedDroneDefenseSystem)")
+    else:
+        if settings_store.system_active:
+            runtime.vision.start()
+            runtime.audio.start()
+            apply_pipeline_params()
+        logger.info("Dashboard backend started (Phase 1 — simulated pipelines)")
 
     asyncio.create_task(video_encode_loop())
     asyncio.create_task(telemetry_loop())
     asyncio.create_task(spectrogram_loop())
-    logger.info("Dashboard backend started (Phase 1 — simulated pipelines)")
 
 
 @app.on_event("shutdown")
