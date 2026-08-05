@@ -13,7 +13,9 @@
       "Bash(python -c \"import main\")",
       "Bash(python -m uvicorn --version)",
       "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
-      "Read(//c/Users/Public/miniconda3/envs/drone_env/Scripts/**)"
+      "Read(//c/Users/Public/miniconda3/envs/drone_env/Scripts/**)",
+      "Bash(python -m py_compile camera_capability_test.py)",
+      "Bash(python -m py_compile calibrate_offset.py)"
     ],
     "additionalDirectories": [
       "C:\\final_project\\gui_dashboard\\__pycache__"

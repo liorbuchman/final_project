@@ -1,0 +1,22 @@
+{
+  "camera_ip": "192.168.1.90",
+  "tests": {
+    "velocity_none_bug": {
+      "was_none_before_patch": true,
+      "note": "If True, camera_AC.setup_camera() would have silently failed on every move_camera() call (AttributeError swallowed by its try/except).",
+      "timestamp": "2026-08-05T10:57:48.981506"
+    },
+    "continuous_move_jog": {
+      "pan_ok": true,
+      "tilt_ok": true,
+      "notes": "no",
+      "timestamp": "2026-08-05T11:00:27.422744"
+    },
+    "get_status_truthfulness": {
+      "changes_with_motion": false,
+      "matches_real_position": false,
+      "notes": "stuck at -1.0 both x and y",
+      "timestamp": "2026-08-05T11:02:34.802313"
+    }
+  }
+}

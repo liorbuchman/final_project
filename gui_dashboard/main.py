@@ -1047,8 +1047,8 @@ async def on_startup():
     handler.setLevel(logging.INFO)
     logger.addHandler(handler)
 
-    if os.environ.get("HARDWARE_MODE") == "1":
-        if hardware_bridge.activate():
+    # if os.environ.get("HARDWARE_MODE") == "1":
+    if hardware_bridge.activate():
             runtime.hardware_active = True
             runtime.hw_vision = hardware_bridge.HardwareVisionPipeline(VisionResult, VisionDetection)
             runtime.hw_audio = hardware_bridge.HardwareAudioPipeline(AudioResult)

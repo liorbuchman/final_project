@@ -49,7 +49,8 @@
   .header-bar > * { flex-shrink: 0; white-space: nowrap; }
   .main-row { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: row; overflow: hidden; }
   .tactical-col { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-  .video-box { flex: 3 1 0; min-height: 0; position: relative; overflow: hidden; background: #000; }
+  .video-box { flex: 4 1 0; min-height: 0; overflow: hidden; background: #000; display: flex; align-items: center; justify-content: center; }
+  .video-frame { position: relative; aspect-ratio: 4 / 3; max-width: 100%; max-height: 100%; width: 100%; background: #000; }
   .radar-box { flex: 1 1 0; min-height: 100px; overflow: hidden; }
   .sidebar-col { width: 320px; flex-shrink: 0; min-height: 0; overflow-y: auto; }
   .bottom-panel { flex-shrink: 0; height: 240px; overflow: hidden; display: flex; flex-direction: column; }
@@ -517,15 +518,19 @@ function App() {
             </div>
           )}
 
-          {/* Video: always mounted <img>, sized by flex-grow (not aspect-ratio) so it
-              never dictates its own height from stream content - no reflow, no flicker. */}
+          {/* Video: always mounted <img>, sized by flex-grow (not aspect-ratio) on the
+              outer box so it never dictates its own height from stream content - no
+              reflow, no flicker. The inner .video-frame hugs the real 4:3 (640x480)
+              content instead of stretching across the whole (much wider) flex slot. */}
           <div className={"video-box w-full " + (debugMode ? "rounded-lg" : "")}>
-            <img src="/video_feed" className="absolute inset-0 w-full h-full object-contain bg-black" />
-            {!camera.connected && (
-              <div className="absolute inset-0 flex items-center justify-center text-gray-500 font-mono text-2xl bg-black">
-                NO SIGNAL
-              </div>
-            )}
+            <div className="video-frame">
+              <img src="/video_feed" className="absolute inset-0 w-full h-full object-contain bg-black" />
+              {!camera.connected && (
+                <div className="absolute inset-0 flex items-center justify-center text-gray-500 font-mono text-2xl bg-black">
+                  NO SIGNAL
+                </div>
+              )}
+            </div>
           </div>
 
           {debugMode && (

@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# main_system.py
-
 import time
 import threading
 import cv2
@@ -19,19 +17,17 @@ import config
 from uav_acoustic.acoustic_processor import AcousticDetector
 from uav_vision.optical_processor import OpticalDetector
 
-
 class SystemState(Enum):
-    SCANNING = 1
-    TRACKING = 2
-    ENGAGED = 3
-
+    SCANNING = 1    # Idle/Acoustic Search
+    TRACKING = 2    # Moving camera to acoustic DOA / Scanning visually
+    ENGAGED = 3     # Visual lock acquired, YOLO tracking active
 
 class IntegratedDroneDefenseSystem:
     def __init__(self):
         self.state = SystemState.SCANNING
         self.running = True
         self.state_timestamp = time.time()
-
+        
         # Thread synchronization primitive for cross-sensor data sharing
         self.data_lock = threading.Lock()
 
@@ -40,7 +36,7 @@ class IntegratedDroneDefenseSystem:
         self.acoustic_azimuth = 0.0
         self.visual_lock_acquired = False
 
-        # Self-health hardware monitoring status metrics
+        # Self-health hardware monitoring
         self.acoustic_hw_status = "INITIALIZING"
         self.optical_hw_status = "INITIALIZING"
 
@@ -49,10 +45,9 @@ class IntegratedDroneDefenseSystem:
         self.video_processor = OpticalDetector()
 
     def init_logging(self):
-        """Initializes non-destructive timestamped logging with Ultralytics override protection."""
+        """Initializes non-destructive timestamped logging."""
         optical_logs_dir = os.path.join(script_dir, "logs", "optical")
         os.makedirs(optical_logs_dir, exist_ok=True)
-
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file_name = f"integrated_system_{current_time}.log"
         log_file_path = os.path.join(optical_logs_dir, log_file_name)
@@ -66,9 +61,10 @@ class IntegratedDroneDefenseSystem:
         logging.info("--- INTEGRATED TACTICAL DRONE DEFENSE GRID ONLINE ---")
 
     def start_defense_grid(self):
-        """Initializes hardware contexts and spawns concurrent subsystem loops."""
+        """Initializes hardware contexts and spawns concurrent subsystem threads."""
         self.init_logging()
 
+        # Load acoustic model
         try:
             self.audio_processor.load_model()
             if getattr(self.audio_processor, 'usb_dev', None) is None:
@@ -77,6 +73,7 @@ class IntegratedDroneDefenseSystem:
             logging.error(f"Acoustic core initial load failure: {audio_err}")
             self.acoustic_hw_status = "UNAVAILABLE"
 
+        # Initialize ONVIF camera
         try:
             self.video_processor.initialize_hardware()
             if getattr(self.video_processor, 'ptz', None) is None:
@@ -92,7 +89,7 @@ class IntegratedDroneDefenseSystem:
         fsm_thread = threading.Thread(target=self.tactical_fsm_loop, daemon=True, name="FSMThread")
         fsm_thread.start()
 
-        # Run optical pipeline on the main thread
+        # Run optical pipeline (Video streaming & YOLO) on the main thread
         self.optical_master_loop()
 
     def acoustic_background_loop(self):
@@ -100,72 +97,62 @@ class IntegratedDroneDefenseSystem:
         import pyaudio
         import numpy as np
 
-        logging.info("[Subsystem] Acoustic monitoring thread successfully deployed.")
         chunk_size = int(config.SAMPLE_RATE * config.WINDOW_SECS)
         p = pyaudio.PyAudio()
         stream = None
-        
         target_idx = None
         target_channels = 6
         
-        logging.info("[Acoustic HW] Scanning active system audio interfaces...")
+        # Scan for ReSpeaker microphone array
         for i in range(p.get_device_count()):
             try:
                 dev_info = p.get_device_info_by_index(i)
                 dev_name = dev_info.get("name", "")
                 max_inputs = dev_info.get("maxInputChannels", 0)
-                
                 if "ReSpeaker" in dev_name or "seeed" in dev_name.lower():
                     target_idx = i
                     target_channels = max_inputs if max_inputs > 0 else 6
-                    logging.info(f"🎤 [FOUND] Device '{dev_name}' bound at Index {target_idx} (Native Channels: {max_inputs})")
                     break
-            except Exception as scan_err:
-                logging.debug(f"Skipping audio node index {i}: {scan_err}")
+            except Exception:
+                pass
 
         if target_idx is None:
-            logging.warning(f"⚠️ [Acoustic HW] ReSpeaker not found by name. Falling back to default index ({config.RESPEAKER_INDEX}).")
             target_idx = config.RESPEAKER_INDEX
 
         while self.running:
-            # Attempt reconnection if stream is inactive
+            # Reconnect stream if necessary
             if stream is None and self.acoustic_hw_status != "UNAVAILABLE":
                 try:
                     stream = p.open(
-                        format=pyaudio.paInt16,
-                        channels=target_channels,
-                        rate=config.SAMPLE_RATE,
-                        input=True,
-                        input_device_index=target_idx,
-                        frames_per_buffer=chunk_size
+                        format=pyaudio.paInt16, channels=target_channels, rate=config.SAMPLE_RATE,
+                        input=True, input_device_index=target_idx, frames_per_buffer=chunk_size
                     )
                     with self.data_lock:
                         self.acoustic_hw_status = "ONLINE"
-                    logging.info(f"[AUDIO HOT] Connection bound to index {target_idx}.")
-                except Exception as e:
-                    logging.error(f"[Acoustic HW] Stream connection failed: {e}")
+                except Exception:
                     with self.data_lock:
                         self.acoustic_hw_status = "UNAVAILABLE"
 
             with self.data_lock:
                 is_hw_active = (self.acoustic_hw_status == "ONLINE")
 
+            # Process audio data if hardware is active
             if is_hw_active and stream is not None:
                 try:
                     raw_bytes = stream.read(chunk_size, exception_on_overflow=False)
                     audio_chunk = np.frombuffer(raw_bytes, dtype=np.int16).reshape(-1, target_channels)
+                    
+                    # Detect drone sound
                     self.audio_processor.process_audio_buffer(audio_chunk)
 
+                    # Update shared variables safely
                     with self.data_lock:
                         self.acoustic_triggered = self.audio_processor.is_triggered
                         self.acoustic_azimuth = self.audio_processor.current_azimuth
-                except Exception as loop_err:
-                    logging.error(f"[Acoustic Loop Fault] Hardware read error: {loop_err}")
+                except Exception:
                     if stream:
-                        try:
-                            stream.close()
-                        except Exception:
-                            pass
+                        try: stream.close()
+                        except: pass
                         stream = None
                     with self.data_lock:
                         self.acoustic_hw_status = "UNAVAILABLE"
@@ -175,7 +162,7 @@ class IntegratedDroneDefenseSystem:
                     self.acoustic_triggered = False
                 time.sleep(1.0)
 
-        # Cleanup block (Single, clean termination)
+        # Cleanup audio resources on exit
         if stream is not None:
             try:
                 stream.stop_stream()
@@ -183,16 +170,15 @@ class IntegratedDroneDefenseSystem:
             except Exception:
                 pass
         p.terminate()
-        logging.info("[Subsystem] Live acoustic streaming interface safely terminated.")
 
     def tactical_fsm_loop(self):
-        """Independent asynchronous loop dedicated entirely to tactical state management (10Hz)."""
-        logging.info("[Subsystem] Tactical FSM thread deployed.")
+        """Independent asynchronous loop managing system states at 10Hz."""
         last_seen_visual_time = time.time()
 
         while self.running:
             curr_time = time.time()
 
+            # Read current status from all sensors safely
             with self.data_lock:
                 audio_alert = self.acoustic_triggered
                 target_azimuth = self.acoustic_azimuth
@@ -200,43 +186,52 @@ class IntegratedDroneDefenseSystem:
                 cam_status = self.optical_hw_status
                 current_state = self.state
 
-            # --- Finite State Machine ---
+            # --- Finite State Machine Logic ---
             if current_state == SystemState.SCANNING:
                 if audio_alert:
-                    logging.info(f"[FSM TRANSITION] SCANNING -> TRACKING. Acoustic vector: {target_azimuth}°")
+                    logging.info(f"[FSM] Drone detected acoustically at {target_azimuth}°. Transitioning to TRACKING.")
                     with self.data_lock:
                         self.state = SystemState.TRACKING
                         self.state_timestamp = curr_time
 
             elif current_state == SystemState.TRACKING:
+                # 1. Target found visually -> ENGAGE
                 if video_lock:
-                    logging.info("[FSM TRANSITION] TRACKING -> ENGAGED. YOLO visual lock confirmed.")
+                    logging.info("[FSM] Target visually locked! Transitioning to ENGAGED.")
                     with self.data_lock:
                         self.state = SystemState.ENGAGED
                     last_seen_visual_time = curr_time
                     if cam_status == "ONLINE":
-                        self.video_processor.track_target(0, 0)
+                        self.video_processor.track_target(0, 0) # Stop scan motors
+                        
+                # 2. Moving camera to search for target
                 elif audio_alert:
                     if cam_status == "ONLINE" and hasattr(self.video_processor, 'handle_acoustic_search'):
+                        # This function handles pan and tilt sweep. Blocks until done or drone is found.
                         self.video_processor.handle_acoustic_search(target_azimuth)
+                    # Reset timeout only AFTER movement/scan is complete
                     with self.data_lock:
-                        self.state_timestamp = curr_time 
+                        self.state_timestamp = time.time() 
+                        
+                # 3. Timeout - Target lost, revert to scan
                 elif curr_time - self.state_timestamp > config.TARGET_LOST_TIMEOUT:
-                    logging.info("[FSM TRANSITION] TRACKING -> SCANNING. Search window expired.")
+                    logging.info("[FSM] Search window expired. Returning to SCANNING.")
                     if cam_status == "ONLINE":
                         self.video_processor.track_target(0, 0)
                     with self.data_lock:
                         self.state = SystemState.SCANNING
 
             elif current_state == SystemState.ENGAGED:
+                # Continue visual tracking
                 if video_lock:
                     last_seen_visual_time = curr_time
                     if cam_status == "ONLINE":
                         self.video_processor.execute_visual_closed_loop()
+                # Target lost briefly
                 else:
                     time_since_last_sight = curr_time - last_seen_visual_time
                     if time_since_last_sight > config.VISUAL_LOCK_COOLDOWN:
-                        logging.info(f"[FSM TRANSITION] ENGAGED -> TRACKING. Target lost for {time_since_last_sight:.1f}s.")
+                        logging.info(f"[FSM] Visual target lost for {time_since_last_sight:.1f}s. Reverting to TRACKING.")
                         with self.data_lock:
                             self.state = SystemState.TRACKING
                             self.state_timestamp = curr_time
@@ -256,14 +251,11 @@ class IntegratedDroneDefenseSystem:
             is_cam_driver_ok = (self.optical_hw_status != "UNAVAILABLE")
 
         if not cap.isOpened() or not is_cam_driver_ok:
-            logging.critical("Failed to instantiate GStreamer pipeline or ONVIF node.")
             with self.data_lock:
                 self.optical_hw_status = "UNAVAILABLE"
         else:
             with self.data_lock:
                 self.optical_hw_status = "ONLINE"
-
-        logging.info("[Subsystem] Master optical processing loop online.")
 
         while self.running:
             frame_fetched = False
@@ -273,36 +265,39 @@ class IntegratedDroneDefenseSystem:
                 is_video_feed_active = (self.optical_hw_status == "ONLINE")
                 current_state = self.state
 
+            # Capture frame
             if is_video_feed_active and cap.isOpened():
                 try:
                     ret, frame = cap.read()
                     if ret:
                         frame_fetched = True
                     else:
-                        logging.warning("Video stream dropped frames.")
                         with self.data_lock:
                             self.optical_hw_status = "UNAVAILABLE"
-                except Exception as stream_err:
-                    logging.error(f"GStreamer low-level capture fault: {stream_err}")
+                except Exception:
                     with self.data_lock:
                         self.optical_hw_status = "UNAVAILABLE"
 
+            # Process frame
             if frame_fetched and frame is not None:
                 frame = cv2.flip(frame, -1)
                 inference_frame = cv2.resize(frame, (config.FRAME_WIDTH, config.FRAME_HEIGHT), interpolation=cv2.INTER_LINEAR)
 
+                # Only run heavy YOLO inference if we are searching or tracking
                 if current_state in [SystemState.TRACKING, SystemState.ENGAGED]:
                     inference_frame = self.video_processor.run_inference(inference_frame)
 
                 with self.data_lock:
                     self.visual_lock_acquired = self.video_processor.visual_lock
             else:
+                # Black screen fallback
                 inference_frame = np.zeros((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8)
                 cv2.putText(inference_frame, "VIDEO SIGNAL: UNAVAILABLE", (80, 250),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
                 with self.data_lock:
                     self.visual_lock_acquired = False
 
+            # Draw UI Overlay
             with self.data_lock:
                 current_state_name = self.state.name
                 mic_status = self.acoustic_hw_status
@@ -310,24 +305,22 @@ class IntegratedDroneDefenseSystem:
 
             banner_color = (0, 0, 0)
             if mic_status == "UNAVAILABLE" or cam_status == "UNAVAILABLE":
-                banner_color = (0, 0, 160)
+                banner_color = (0, 0, 160) # Red banner for hardware faults
 
             overlay_text = f"FSM: {current_state_name} | MIC: {mic_status} | CAM: {cam_status}"
             cv2.rectangle(inference_frame, (0, 0), (inference_frame.shape[1], 40), banner_color, -1)
             cv2.putText(inference_frame, overlay_text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
-            # Safe GUI display catch for headless environments
+            # Display video
             try:
                 cv2.imshow("Tactical Multi-Modal Interceptor Grid", inference_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
-                    logging.info("[Main] Termination requested via keyboard interrupt.")
                     self.running = False
                     break
-            except cv2.error as gui_err:
-                # Log once or skip GUI rendering if no display is available
+            except cv2.error:
                 pass
 
-        logging.info("Arresting PTZ physical payloads and freeing context links.")
+        # Cleanup on exit
         with self.data_lock:
             can_shutdown_motors = (self.optical_hw_status == "ONLINE")
         if can_shutdown_motors:
@@ -340,7 +333,6 @@ class IntegratedDroneDefenseSystem:
             cv2.destroyAllWindows()
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     defense_grid = IntegratedDroneDefenseSystem()

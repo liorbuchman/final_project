@@ -67,7 +67,6 @@ def move_camera(ptz, request, x, y):
     x_rounded = round(float(x), 2)
     y_rounded = round(float(y), 2)
     
-    #  OPTIMIZATION: Skip HTTP request if speeds haven't changed
     if x_rounded == last_pan_speed and y_rounded == last_tilt_speed:
         return
         
@@ -84,6 +83,10 @@ def move_camera(ptz, request, x, y):
         # Reset cache on error to force a retry on the next FSM tick
         last_pan_speed = None
         last_tilt_speed = None
+        
+def stop_camera(ptz, request):
+    """Sends a zero velocity command to instantly halt the camera motors."""
+    move_camera(ptz, request, 0.0, 0.0)
 
 def set_light_raw(ptz_url, profile_token, command):
     if not ptz_url: return

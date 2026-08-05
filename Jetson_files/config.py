@@ -27,11 +27,18 @@ STEP_SECS = 0.5
 RESPEAKER_INDEX = 1
 SMOOTHING_WINDOW = 1
 
-# --- Acoustic Targeting & Sweep Settings ---
-CAMERA_MOUNT_OFFSET = 0.0      # Calibration: Angle offset between Mic 0° and Camera front
-KP_PAN_ACOUSTIC = 0.02         # Proportional gain for acoustic panning speed
-SWEEP_FREQUENCY = 1.5          # Frequency of vertical sine wave sweep
-SWEEP_SPEED_MULTIPLIER = 0.3   # Max tilt motor speed during search (0.0 to 1.0)
+#Camera Physical Limits & Calibration
+MOVE_SPEED = 0.5
+MIN_ANGLE = -170.0              
+MAX_ANGLE = 170.0               
+TIME_PER_DEGREE = 0.0749
+
+# Tilt Scanning settings
+MIN_TILT = 5.0
+MAX_TILT = 45.0
+TILT_RANGE_SOFTWARE = 85.0
+TILT_TIME_END_TO_END = 7.0
+TIME_PER_DEGREE_TILT = TILT_TIME_END_TO_END / TILT_RANGE_SOFTWARE
 
 # --- FSM Tactical Timeouts & Visual Tracking ---
 TARGET_LOST_TIMEOUT = 5.0
