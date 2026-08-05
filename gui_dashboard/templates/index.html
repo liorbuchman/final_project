@@ -69,22 +69,25 @@ const STATE_COLORS = {
   TRACKING: "led-tracking", ENGAGED: "led-engaged", DEGRADED: "led-degraded",
 };
 
+// liveHardware: true => actually wired to the real system (config.YOLO_CONF_THRESHOLD /
+// config.AUDIO_CLASSIFICATION_THRESHOLD via hardware_bridge.py). Everything else only
+// affects the simulated/replay pipelines - dimmed + labeled when running live on hardware.
 const SLIDER_DEFS = [
-  { key: "yolo_threshold", label: "YOLO Confidence Threshold", min: 0, max: 1, step: 0.01,
+  { key: "yolo_threshold", label: "YOLO Confidence Threshold", min: 0, max: 1, step: 0.01, liveHardware: true,
     tip: "Minimum confidence score required for YOLOv8n to flag a visual bounding box as a drone." },
-  { key: "audio_threshold", label: "Acoustic CNN Threshold", min: 0, max: 1, step: 0.01,
+  { key: "audio_threshold", label: "Acoustic CNN Threshold", min: 0, max: 1, step: 0.01, liveHardware: true,
     tip: "Probability cutoff for the Audio CNN classifier to trigger an acoustic detection alarm." },
-  { key: "fusion_window_ms", label: "Sensor Fusion Window (ms)", min: 100, max: 2000, step: 10,
+  { key: "fusion_window_ms", label: "Sensor Fusion Window (ms)", min: 100, max: 2000, step: 10, liveHardware: false,
     tip: "The time window in which visual and acoustic detections must overlap to trigger a combined system alarm." },
-  { key: "audio_gain", label: "Audio Gain / Pre-amp", min: 1, max: 10, step: 0.1,
+  { key: "audio_gain", label: "Audio Gain / Pre-amp", min: 1, max: 10, step: 0.1, liveHardware: false,
     tip: "Digital multiplier applied to raw audio streams before spectrogram generation." },
-  { key: "nms_threshold", label: "NMS Threshold", min: 0.1, max: 0.9, step: 0.01,
+  { key: "nms_threshold", label: "NMS Threshold", min: 0.1, max: 0.9, step: 0.01, liveHardware: false,
     tip: "IoU overlap threshold for filtering duplicate YOLO bounding boxes on the same target." },
-  { key: "slew_timeout_s", label: "Slew Window Timeout (s)", min: 1.0, max: 5.0, step: 0.1,
+  { key: "slew_timeout_s", label: "Slew Window Timeout (s)", min: 1.0, max: 5.0, step: 0.1, liveHardware: false,
     tip: "The duration in seconds the system waits for mechanical stabilization of the PTZ camera before initiating YOLO tracking loop." },
-  { key: "lost_lock_timeout_s", label: "Lost Lock Timeout (s)", min: 1.0, max: 10.0, step: 0.1,
+  { key: "lost_lock_timeout_s", label: "Lost Lock Timeout (s)", min: 1.0, max: 10.0, step: 0.1, liveHardware: false,
     tip: "The time window the system tolerates an obscured visual track before declaring a false alarm and reverting to acoustic searching." },
-  { key: "audio_buffer_size", label: "Acoustic Buffer Frame Size", min: 128, max: 1024, step: 32,
+  { key: "audio_buffer_size", label: "Acoustic Buffer Frame Size", min: 128, max: 1024, step: 32, liveHardware: false,
     tip: "Controls the length of the audio frame buffer used for generating the raw spectrogram before feeding it into the Acoustic CNN classifier." },
 ];
 
@@ -125,6 +128,7 @@ function App() {
   const [availableRecordings, setAvailableRecordings] = useState([]);
   const [selectedRecording, setSelectedRecording] = useState("");
   const [activeTab, setActiveTab] = useState("System Logs");
+  const [hardwareMode, setHardwareMode] = useState(false);
 
   const wsRef = useRef(null);
   const backoffRef = useRef(1000);
@@ -171,6 +175,7 @@ function App() {
         case "telemetry": {
           setTelemetry(msg);
           setSimActive(!!msg.sim);
+          setHardwareMode(!!msg.hardware);
           if (msg.state === "ENGAGED" && prevStateRef.current !== "ENGAGED" && !alarmMuted) beep();
           prevStateRef.current = msg.state;
           const now = Date.now() / 1000;
@@ -542,30 +547,41 @@ function App() {
             </div>
           )}
 
-          {/* Radar: guaranteed via .radar-box (flex:1, min-height:100px - can never collapse). */}
-          <div className={"radar-box w-full bg-panel p-2 " + (debugMode ? "rounded-lg" : "")}>
+          {/* Radar: guaranteed via .radar-box (flex:1, min-height:100px - can never collapse).
+              Hidden (not unmounted, keeps the canvas ref/draw loop harmless) in hardware
+              mode - the bridge doesn't surface real per-target azimuth yet, so it would
+              only ever show an empty plot there. display:none removes it from the flex
+              distribution entirely, so the video box automatically fills 100% of the
+              tactical column's height. Still fully live in simulated/replay mode. */}
+          <div className={"radar-box w-full bg-panel p-2 " + (hardwareMode ? "hidden " : "") + (debugMode ? "rounded-lg" : "")}>
             <canvas ref={radarCanvasRef} className="w-full h-full block"></canvas>
           </div>
         </div>
 
         {/* Diagnostics-Col: guaranteed fixed width via .sidebar-col, always mounted,
             CSS-hidden (not unmounted) in Presentation Mode, internally scrollable so
-            it's never pushed off-screen. */}
+            it's never pushed off-screen. Split into "Live Hardware Controls" (actually
+            wired to config.YOLO_CONF_THRESHOLD/config.AUDIO_CLASSIFICATION_THRESHOLD via
+            hardware_bridge.py) and "Simulation / Replay Only" (everything else) - the
+            second group is only dimmed/labeled when hardwareMode is true; in simulated
+            or replay mode every control behaves exactly as before. */}
         <div className={(debugMode ? "flex" : "hidden") + " sidebar-col flex-col bg-panel p-3 border-l border-gray-800"}>
           <h2 className="font-semibold text-sm text-gray-300 mb-3 shrink-0">Hyperparameter Control Panel</h2>
-          <div className="flex flex-col gap-3">
-            {SLIDER_DEFS.map(def => (
-              <div key={def.key} title={def.tip} className={pending[def.key] ? "pending-ring rounded p-1" : "p-1"}>
-                <div className="text-xs text-gray-400 flex justify-between">
-                  <span>{def.label}</span>
-                  <span className="tabular-nums">{settings ? settings[def.key] : "--"}</span>
-                </div>
-                <input type="range" min={def.min} max={def.max} step={def.step}
-                  disabled={!connected}
-                  value={settings ? settings[def.key] : def.min}
-                  onChange={e => updateSetting(def.key, parseFloat(e.target.value))}
-                  className="w-full" />
-              </div>
+
+          <div className="text-xs font-semibold text-green-400 uppercase tracking-wide mb-2">Live Hardware Controls</div>
+          <div className="flex flex-col gap-3 mb-4">
+            {SLIDER_DEFS.filter(def => def.liveHardware).map(def => (
+              <SliderControl key={def.key} def={def} settings={settings} pending={pending} connected={connected} updateSetting={updateSetting} />
+            ))}
+          </div>
+
+          <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-2">
+            Simulation / Replay Only
+            {hardwareMode && <span className="normal-case bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded text-[10px] font-normal">Inactive in Hardware Mode</span>}
+          </div>
+          <div className={"flex flex-col gap-3 " + (hardwareMode ? "opacity-40" : "")}>
+            {SLIDER_DEFS.filter(def => !def.liveHardware).map(def => (
+              <SliderControl key={def.key} def={def} settings={settings} pending={pending} connected={connected} updateSetting={updateSetting} />
             ))}
             <div title="Inverts the camera pan/tilt axes to dynamically compensate for the upside-down physical installation of the PTZ housing on the tactical rig."
               className={"p-1 flex items-center gap-2 " + (pending.invert_camera_vector ? "pending-ring rounded" : "")}>
@@ -650,6 +666,22 @@ function App() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function SliderControl({ def, settings, pending, connected, updateSetting }) {
+  return (
+    <div title={def.tip} className={pending[def.key] ? "pending-ring rounded p-1" : "p-1"}>
+      <div className="text-xs text-gray-400 flex justify-between">
+        <span>{def.label}</span>
+        <span className="tabular-nums">{settings ? settings[def.key] : "--"}</span>
+      </div>
+      <input type="range" min={def.min} max={def.max} step={def.step}
+        disabled={!connected}
+        value={settings ? settings[def.key] : def.min}
+        onChange={e => updateSetting(def.key, parseFloat(e.target.value))}
+        className="w-full" />
     </div>
   );
 }

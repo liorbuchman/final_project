@@ -15,7 +15,8 @@
       "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
       "Read(//c/Users/Public/miniconda3/envs/drone_env/Scripts/**)",
       "Bash(python -m py_compile camera_capability_test.py)",
-      "Bash(python -m py_compile calibrate_offset.py)"
+      "Bash(python -m py_compile calibrate_offset.py)",
+      "Bash(curl -s -o /dev/null -w \"index: %{http_code}\\\\n\" http://127.0.0.1:8152/)"
     ],
     "additionalDirectories": [
       "C:\\final_project\\gui_dashboard\\__pycache__"
