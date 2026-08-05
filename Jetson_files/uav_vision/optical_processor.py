@@ -59,14 +59,56 @@ class OpticalDetector:
         move_camera(self.ptz, self.move_req, pan_speed, tilt_speed)
         
     def execute_visual_closed_loop(self):
-        """Phase 2: Visual Tracking P-Controller."""
-        if self.ptz is None: return
+        """
+        Phase 2: Visual Tracking - Zoned Control with Deadband for ONVIF Optimization.
+        This approach drastically reduces network spam by sending discrete speed commands
+        only when the target crosses specific bounding zones.
+        """
+        if self.ptz is None: 
+            return
         
-        pan_speed = max(-1.0, min(1.0, self.error_x * config.KP_PAN))
-        raw_tilt_speed = self.error_y * config.KP_TILT
+        # 1. Define the Deadzone - The target is centered enough, do not move the motors.
+        # This prevents micro-jitters when the drone is hovering in the center.
+        deadzone_x = config.FRAME_WIDTH * 0.15  # ~96 pixels from the center horizontally
+        deadzone_y = config.FRAME_HEIGHT * 0.15 # ~72 pixels from the center vertically
         
-        tilt_speed = max(-1.0, min(1.0, raw_tilt_speed * config.TILT_DIRECTION_INVERSION))
+        # 2. Define tered motor speeds (Gears)
+        fast_speed = 0.8 # Maximum speed for when the target is escaping the frame edge
+        smooth_speed = 0.4 # Slower, smooth speed for normal tracking (can be tuned)
         
+        pan_speed = 0.0
+        tilt_speed = 0.0
+        
+        # --- X-Axis (Pan) Logic ---
+        abs_error_x = abs(self.error_x)
+        if abs_error_x > deadzone_x:
+            # If the target is near the extreme edges of the screen -> go fast. Otherwise -> smooth.
+            if abs_error_x > (config.FRAME_WIDTH * 0.35):
+                base_pan = fast_speed
+            else:
+                base_pan = smooth_speed
+            
+            # Apply direction based on your specific camera hardware calibration.
+            # If error_x > 0, the target is on the right side of the screen.
+            # Note: Right movement is negative (-) based on previous physical tests.
+            pan_speed = -base_pan if self.error_x > 0 else base_pan
+
+        # --- Y-Axis (Tilt) Logic ---
+        abs_error_y = abs(self.error_y)
+        if abs_error_y > deadzone_y:
+            if abs_error_y > (config.FRAME_HEIGHT * 0.35):
+                base_tilt = fast_speed
+            else:
+                base_tilt = smooth_speed
+            
+            # If error_y > 0, the target is in the lower part of the screen, so we move down.
+            # TILT_DIRECTION_INVERSION from config handles upside-down ceiling installations.
+            raw_tilt_speed = base_tilt if self.error_y > 0 else -base_tilt
+            tilt_speed = raw_tilt_speed * config.TILT_DIRECTION_INVERSION
+
+        # 3. Dispatch the command!
+        # Thanks to the state-caching mechanism in camera_AC.py, an actual HTTP/SOAP request 
+        # is ONLY sent over the network if the calculated speeds have physically changed.
         self.track_target(pan_speed, tilt_speed)
 
     def calculate_pan_movement(self, target_doa):
@@ -148,7 +190,7 @@ class OpticalDetector:
         # ==========================================
         logging.info("[Optical] Initiating Vertical Scan...")
         current_tilt = config.MIN_TILT
-        scan_step = 10.0
+        scan_step = 20.0
         direction_tilt = "Up"
         time_per_step = scan_step * config.TIME_PER_DEGREE_TILT
 
@@ -164,7 +206,7 @@ class OpticalDetector:
 
         # 2B. Execute step-by-step vertical scan
         # Limited to 20 sweeps to prevent infinite loop if drone flies away
-        max_scan_sweeps = 20
+        max_scan_sweeps = 8
         for _ in range(max_scan_sweeps):
             # Pre-check visual lock
             if self.visual_lock:

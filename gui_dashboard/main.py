@@ -1057,7 +1057,7 @@ async def on_startup():
             runtime.live_audio = runtime.hw_audio
             runtime.vision = runtime.hw_vision
             runtime.audio = runtime.hw_audio
-        else:
+    else:
             logger.warning("HARDWARE_MODE=1 requested but the hardware bridge failed to activate — staying simulated")
 
     if runtime.hardware_active:
