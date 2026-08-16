@@ -2,13 +2,15 @@ import usb.core
 import usb.util
 import libusb_package
 import time
+import config
+
 
 class ReSpeakerV31Leds:
     def __init__(self):
         # Clean discovery target lookup without opening persistent locking handles
         backend = libusb_package.get_libusb1_backend()
-        dev = usb.core.find(idVendor=0x2886, idProduct=0x0018, backend=backend)
-        
+        dev = usb.core.find(idVendor=config.IDVENDOR, idProduct=config.IDPRODUCT, backend=backend)
+
         if dev is None:
             raise RuntimeError("ReSpeaker V3.1 hardware descriptor not found on USB bus.")
         print("Successfully verified ReSpeaker V3.1 LED Controller configuration.")
@@ -21,7 +23,7 @@ class ReSpeakerV31Leds:
         the Linux kernel never drops or unbinds the ALSA mic streaming lines.
         """
         backend = libusb_package.get_libusb1_backend()
-        dev = usb.core.find(idVendor=0x2886, idProduct=0x0018, backend=backend)
+        dev = usb.core.find(idVendor=config.IDVENDOR, idProduct=config.IDPRODUCT, backend=backend)
         if dev is None:
             return
             

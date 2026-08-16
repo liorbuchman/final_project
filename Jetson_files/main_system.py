@@ -6,6 +6,8 @@ import logging
 import datetime
 import os
 import sys
+import pyaudio
+import numpy as np
 from enum import Enum
 
 # Resolve workspace paths for multi-modal submodule discovery
@@ -93,17 +95,13 @@ class IntegratedDroneDefenseSystem:
         self.optical_master_loop()
 
     def acoustic_background_loop(self):
-        """Asynchronous execution pipe dedicated solely to live ReSpeaker hardware streaming."""
-        import pyaudio
-        import numpy as np
-
-        chunk_size = int(config.SAMPLE_RATE * config.WINDOW_SECS)
-        p = pyaudio.PyAudio()
-        stream = None
-        target_idx = None
+        """Continuous audio capture and processing loop running on a dedicated thread."""
+        window_samples = int(config.SAMPLE_RATE * getattr(config, 'WINDOW_SECS', 1.0))
+        step_samples = int(config.SAMPLE_RATE * getattr(config, 'STEP_SECS', 0.2))
         target_channels = 6
-        
-        # Scan for ReSpeaker microphone array
+        target_idx = None
+
+        p = pyaudio.PyAudio()
         for i in range(p.get_device_count()):
             try:
                 dev_info = p.get_device_info_by_index(i)
@@ -119,50 +117,57 @@ class IntegratedDroneDefenseSystem:
         if target_idx is None:
             target_idx = config.RESPEAKER_INDEX
 
+        ring_buffer = np.zeros((window_samples, target_channels), dtype=np.int16)
+        stream = None
+
         while self.running:
-            # Reconnect stream if necessary
             if stream is None and self.acoustic_hw_status != "UNAVAILABLE":
                 try:
                     stream = p.open(
-                        format=pyaudio.paInt16, channels=target_channels, rate=config.SAMPLE_RATE,
-                        input=True, input_device_index=target_idx, frames_per_buffer=chunk_size
+                        format=pyaudio.paInt16,
+                        channels=target_channels,
+                        rate=config.SAMPLE_RATE,
+                        input=True,
+                        input_device_index=target_idx,
+                        frames_per_buffer=step_samples
                     )
                     with self.data_lock:
                         self.acoustic_hw_status = "ONLINE"
-                except Exception:
+                except Exception as e:
                     with self.data_lock:
                         self.acoustic_hw_status = "UNAVAILABLE"
+                    time.sleep(1.0)
+                    continue
 
             with self.data_lock:
-                is_hw_active = (self.acoustic_hw_status == "ONLINE")
+                is_hw_active = (self.acoustic_hw_status in ["ONLINE", "WARNING_NO_USB"])
 
-            # Process audio data if hardware is active
             if is_hw_active and stream is not None:
                 try:
-                    raw_bytes = stream.read(chunk_size, exception_on_overflow=False)
-                    audio_chunk = np.frombuffer(raw_bytes, dtype=np.int16).reshape(-1, target_channels)
-                    
-                    # Detect drone sound
-                    self.audio_processor.process_audio_buffer(audio_chunk)
+                    raw_bytes = stream.read(step_samples, exception_on_overflow=False)
+                    new_chunk = np.frombuffer(raw_bytes, dtype=np.int16).reshape(-1, target_channels)
 
-                    # Update shared variables safely
+                    ring_buffer = np.roll(ring_buffer, -len(new_chunk), axis=0)
+                    ring_buffer[-len(new_chunk):, :] = new_chunk
+
+                    self.audio_processor.process_audio_buffer(ring_buffer)
+
                     with self.data_lock:
                         self.acoustic_triggered = self.audio_processor.is_triggered
                         self.acoustic_azimuth = self.audio_processor.current_azimuth
-                except Exception:
+
+                except Exception as stream_err:
+                    logging.warning(f"Acoustic stream read error: {stream_err}")
                     if stream:
                         try: stream.close()
                         except: pass
                         stream = None
-                    with self.data_lock:
-                        self.acoustic_hw_status = "UNAVAILABLE"
-                    time.sleep(config.STEP_SECS)
+                    time.sleep(getattr(config, 'STEP_SECS', 0.2))
             else:
                 with self.data_lock:
                     self.acoustic_triggered = False
-                time.sleep(1.0)
+                time.sleep(0.5)
 
-        # Cleanup audio resources on exit
         if stream is not None:
             try:
                 stream.stop_stream()

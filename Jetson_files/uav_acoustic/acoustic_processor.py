@@ -2,6 +2,7 @@ import os
 import logging
 import time
 import struct
+import math
 import numpy as np
 import librosa
 import torch
@@ -9,6 +10,7 @@ import torch.nn.functional as F
 import usb.core
 import usb.util
 import config
+import libusb_package
 from uav_acoustic.model import SmallCNN                  
 from uav_acoustic.respeaker_usb_led import ReSpeakerV31Leds
 
@@ -26,17 +28,19 @@ logger.addHandler(file_handler)
 
 class AcousticDetector:
     def __init__(self):
-        self.model_dir = config.AUDIO_MODEL_DIR
         self.model = None
         self.mean = None
         self.std = None
         self.is_triggered = False
         self.current_azimuth = 0.0
-        self.current_elevation = 0.0
         self.last_valid_azimuth = 0.0
         self.lock_initialized = False # Tracks initial target acquisition state
         
-        # Exact DSP matching parameters
+        # Outlier rejection variables for abrupt angle jumps (Problem 2)
+        self.outlier_streak_count = 0
+        self.candidate_azimuth = 0.0
+
+        # Exact DSP matching parameters from config (Single Source of Truth)
         self.sr = 16000
         self.n_mels = 128
         self.n_fft = 1024
@@ -45,7 +49,8 @@ class AcousticDetector:
 
         # Connect to the raw XMOS USB interface for hardware parameter tuning
         try:
-            self.usb_dev = usb.core.find(idVendor=0x2886, idProduct=0x0018)
+            backend = libusb_package.get_libusb1_backend()
+            self.usb_dev = usb.core.find(idVendor=config.IDVENDOR, idProduct=config.IDPRODUCT, backend=backend)
             if self.usb_dev:
                 logger.info("Successfully connected to ReSpeaker XMOS USB hardware tuning core.")
             else:
@@ -65,12 +70,28 @@ class AcousticDetector:
     def load_model(self):
         print("[Acoustic] Loading neural network checkpoints and weights...")
         try:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = config.DEVICE
             self.model = SmallCNN(n_classes=2).to(device)
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            model_path = os.path.join(current_dir, "best_model.pt")
             
-            checkpoint = torch.load(model_path, map_location=device)
+            # Multi-path safe weight resolution
+            potential_paths = [
+                os.path.join(current_dir, "best_model.pt"),
+                os.path.join(config.AUDIO_MODEL_DIR, "best_model.pt"),
+                os.path.join(os.getcwd(), "uav_acoustic", "best_model.pt"),
+                os.path.join(os.getcwd(), "best_model.pt")
+            ]
+            
+            model_path = None
+            for p in potential_paths:
+                if os.path.exists(p):
+                    model_path = p
+                    break
+                    
+            if model_path is None:
+                raise FileNotFoundError("best_model.pt not found in any standard directory.")
+            
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
             self.model.load_state_dict(checkpoint["state_dict"])
             self.mean = checkpoint["mean"]
             self.std = checkpoint["std"]
@@ -92,36 +113,45 @@ class AcousticDetector:
 
     def read_hardware_doa_angle(self):
         """
-        Queries the ReSpeaker XMOS hardware register directly via USB control transfer 
-        to fetch the built-in calculated DOAANGLE (Parameter ID 21).
+        Queries the ReSpeaker XVF-3000 DOAANGLE parameter (ID 21) via USB control transfer.
+        wValue 0xC0 = read flag (0x80) | int type (0x40) | offset 0.
+        Response: 8 bytes = [int32 value][int32 metadata].
         """
         if self.usb_dev is None:
-            return 0.0
+            return self.last_valid_azimuth
         try:
-            # Control Transfer Specs for reading integer parameter 21 (DOAANGLE):
-            # bmRequestType = 0xC0 (Vendor Class Incoming Device Read)
-            # bRequest = 0
-            # wValue = 0xC0 (Command payload construction indicator for int)
-            # wIndex = 21 (DOAANGLE register identifier index)
-            # length = 8 bytes (Returns value and type payload)
             res = self.usb_dev.ctrl_transfer(0xC0, 0, 0xC0, 21, 8, 500)
-            if len(res) >= 4:
-                # Unpack the native 4-byte little-endian signed integer
-                hardware_angle = float(struct.unpack(b'ii', res)[0])
-                return hardware_angle
+            if len(res) >= 8:
+                hardware_angle, _ = struct.unpack('ii', res.tobytes())
+                return float(hardware_angle)
         except Exception as e:
             logger.error(f"USB Control Transfer failed to read hardware DOA register: {e}")
-        return 0.0
+        return self.last_valid_azimuth
 
     def process_audio_buffer(self, raw_buffer):
         """Processes audio data loop, handles CNN execution, and updates hardware telemetry."""
-        # Step 1: Execute CNN Classification
-        y_chunk = raw_buffer[:, 0].astype(np.float32)
-        max_amp = np.max(np.abs(y_chunk))
+        ch = getattr(config, 'AUDIO_CHANNEL', 0)
+        y_chunk = raw_buffer[:, ch].astype(np.float32) / 32768.0
+
+        # Step 1: Energy Gating Check (Problem 1 - prevents false positives from background noise)
+        rms_energy = float(np.sqrt(np.mean(y_chunk ** 2)))
+        if getattr(config, 'ENABLE_ENERGY_GATE', True):
+            if rms_energy < getattr(config, 'AUDIO_MIN_RMS_THRESHOLD', 0.015):
+                if self.is_triggered:
+                    logger.info(f"EVENT END - Energy below threshold (RMS: {rms_energy:.4f})")
+                self.is_triggered = False
+                self.lock_initialized = False
+                if self.leds:
+                    self.leds.mono(0x001100) # Soft Green
+                return 0.0
+        
+        # Normalize chunk for CNN matching
+        y_norm = y_chunk.copy()
+        max_amp = np.max(np.abs(y_norm))
         if max_amp > 1e-8:
-            y_chunk /= max_amp
+            y_norm /= max_amp
             
-        mel_spec = self.compute_live_logmel(y_chunk)
+        mel_spec = self.compute_live_logmel(y_norm)
         x_tensor = torch.from_numpy(mel_spec).float()
         x_tensor = (x_tensor - self.mean) / self.std
         x_tensor = x_tensor.unsqueeze(0).unsqueeze(0)
@@ -136,7 +166,6 @@ class AcousticDetector:
 
         # Step 2: Extract real-time hardware tracking telemetry from chip
         calculated_azimuth = self.read_hardware_doa_angle()
-        self.current_elevation = 0.0 # XMOS integrated chipset operates in 2D plane tracking only
 
         # Step 3: Threshold and System lock pipeline management
         if prediction_score > config.AUDIO_CLASSIFICATION_THRESHOLD:
@@ -161,16 +190,44 @@ class AcousticDetector:
         return prediction_score
 
     def apply_azimuth_smoothing(self, raw_azimuth):
-        """Filters tracking anomalies using shortest angular distance tracking logic."""
+        """
+        Filters tracking anomalies using shortest angular distance tracking logic 
+        combined with an outlier consensus filter to prevent jumping to 180° opposite noise.
+        """
         if not self.lock_initialized:
             self.last_valid_azimuth = raw_azimuth
             self.lock_initialized = True
+            self.outlier_streak_count = 0
             return raw_azimuth
             
-        # Compute dynamic angular wrap-around difference
-        angular_diff = (raw_azimuth - self.last_valid_azimuth + 180) % 360 - 180
-        if abs(angular_diff) > 45.0:
+        # Compute dynamic short-arc angular difference: range [-180, +180]
+        angular_diff = (raw_azimuth - self.last_valid_azimuth + 180.0) % 360.0 - 180.0
+        
+        max_jump = getattr(config, 'DOA_MAX_JUMP_DEG', 45.0)
+        confirm_count = getattr(config, 'DOA_OUTLIER_CONFIRM_COUNT', 3)
+        alpha = getattr(config, 'DOA_SMOOTHING_ALPHA', 0.35)
+
+        # Reject abrupt outliers (e.g., sudden 180° room reflections)
+        if abs(angular_diff) > max_jump:
+            if self.outlier_streak_count == 0:
+                self.candidate_azimuth = raw_azimuth
+                self.outlier_streak_count = 1
+            else:
+                cand_diff = abs((raw_azimuth - self.candidate_azimuth + 180.0) % 360.0 - 180.0)
+                if cand_lib := (cand_diff < max_jump):
+                    self.outlier_streak_count += 1
+                else:
+                    self.candidate_azimuth = raw_azimuth
+                    self.outlier_streak_count = 1
+
+            if self.outlier_streak_count >= confirm_count:
+                self.last_valid_azimuth = self.candidate_azimuth
+                self.outlier_streak_count = 0
+                return self.last_valid_azimuth
+
             return self.last_valid_azimuth
-            
-        self.last_valid_azimuth = raw_azimuth
-        return raw_azimuth
+
+        self.outlier_streak_count = 0
+        smoothed_azimuth = self.last_valid_azimuth + alpha * angular_diff
+        self.last_valid_azimuth = (smoothed_azimuth + 360.0) % 360.0
+        return self.last_valid_azimuth

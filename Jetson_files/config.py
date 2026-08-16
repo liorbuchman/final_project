@@ -20,12 +20,27 @@ YOLO_CONF_THRESHOLD = 0.6
 
 # --- Acoustic Settings ---
 AUDIO_MODEL_DIR = os.path.join(BASE_DIR, "uav_acoustic")
+IDVENDOR = 0x2886
+IDPRODUCT = 0x0018
+AUDIO_CHANNEL = 0
 AUDIO_CLASSIFICATION_THRESHOLD = 0.8
 SAMPLE_RATE = 16000
 WINDOW_SECS = 1.0
-STEP_SECS = 0.5
+STEP_SECS = 0.2
 RESPEAKER_INDEX = 1
 SMOOTHING_WINDOW = 1
+ENABLE_ENERGY_GATE = True
+AUDIO_MIN_RMS_THRESHOLD = 0.02 #enrgey lower threshod -> going to be zero
+DOA_SMOOTHING_ALPHA = 0.35         
+DOA_MAX_JUMP_DEG = 45.0             
+
+#dsp card function  
+RESPEAKER_TUNE_DSP = True #endable DSP tuning for ReSpeaker V3.1
+RESPEAKER_DISABLE_AGC = True       
+RESPEAKER_DISABLE_NS = True        
+RESPEAKER_DISABLE_AEC = True      
+RESPEAKER_DISABLE_HPF = True
+
 
 #Camera Physical Limits & Calibration
 MOVE_SPEED = 0.5
