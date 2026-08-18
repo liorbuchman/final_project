@@ -24,7 +24,7 @@ class SystemState(Enum):
     TRACKING = 2    # Moving camera to acoustic DOA / Scanning visually
     ENGAGED = 3     # Visual lock acquired, YOLO tracking active
 
-class IntegratedDroneDefenseSystem:
+class ComrandInBattle:
     def __init__(self):
         self.state = SystemState.SCANNING
         self.running = True
@@ -47,22 +47,35 @@ class IntegratedDroneDefenseSystem:
         self.video_processor = OpticalDetector()
 
     def init_logging(self):
-        """Initializes non-destructive timestamped logging."""
-        optical_logs_dir = os.path.join(script_dir, "logs", "optical")
+        """Initializes non-destructive timestamped logging for the integrated system and all subsystems."""
+        # Base logs directory and subsystem subdirectories
+        logs_base_dir = os.path.join(script_dir, "logs")
+        system_logs_dir = os.path.join(logs_base_dir, "system")
+        optical_logs_dir = os.path.join(logs_base_dir, "optical")
+        acoustic_logs_dir = os.path.join(logs_base_dir, "acoustic")
+
+        # Create all log directories if they do not exist
+        os.makedirs(system_logs_dir, exist_ok=True)
         os.makedirs(optical_logs_dir, exist_ok=True)
+        os.makedirs(acoustic_logs_dir, exist_ok=True)
+
+        # Unique timestamped log filename for the current session
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file_name = f"integrated_system_{current_time}.log"
-        log_file_path = os.path.join(optical_logs_dir, log_file_name)
+        log_file_path = os.path.join(system_logs_dir, log_file_name)
 
+        # Configure root logger to capture logs from all subsystems and stdout
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[logging.FileHandler(log_file_path), logging.StreamHandler(sys.stdout)],
+            format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
+            handlers=[
+                logging.FileHandler(log_file_path, encoding='utf-8'),
+                logging.StreamHandler(sys.stdout)
+            ],
             force=True
         )
         logging.info("--- INTEGRATED TACTICAL DRONE DEFENSE GRID ONLINE ---")
-
-    def start_defense_grid(self):
+    def initialize_system(self):
         """Initializes hardware contexts and spawns concurrent subsystem threads."""
         self.init_logging()
 
@@ -78,6 +91,7 @@ class IntegratedDroneDefenseSystem:
         # Initialize ONVIF camera
         try:
             self.video_processor.initialize_hardware()
+            self.video_processor.auto_calibrate_and_home()
             if getattr(self.video_processor, 'ptz', None) is None:
                 self.optical_hw_status = "UNAVAILABLE"
         except Exception as video_err:
@@ -340,5 +354,21 @@ class IntegratedDroneDefenseSystem:
             pass
 
 if __name__ == "__main__":
-    defense_grid = IntegratedDroneDefenseSystem()
-    defense_grid.start_defense_grid()
+    DroneSystem = ComrandInBattle()
+    
+    try:
+        DroneSystem.initialize_system()
+    except KeyboardInterrupt:
+        logging.warning("[System] Manual interruption (Ctrl+C) received. Shutting down...")
+        DroneSystem.running = False  
+        
+        if DroneSystem.optical_hw_status == "ONLINE":
+            try:
+                DroneSystem.video_processor.track_target(0.0, 0.0)
+                logging.info("[System] PTZ motors stopped securely.")
+            except Exception as e:
+                logging.error(f"[System] Failed to stop PTZ motors during shutdown: {e}")
+                
+    finally:
+        logging.info("--- INTEGRATED TACTICAL DRONE DEFENSE GRID OFFLINE ---")
+        logging.shutdown()

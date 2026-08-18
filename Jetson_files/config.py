@@ -16,7 +16,8 @@ CAMERA_PASS = 'admin'
 YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "best.pt")
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
-YOLO_CONF_THRESHOLD = 0.5
+YOLO_LOW_CONF_THRESHOLD = 0.2
+YOLO_HIGH_CONF_THRESHOLD = 0.6
 
 # --- Acoustic Settings ---
 AUDIO_MODEL_DIR = os.path.join(BASE_DIR, "uav_acoustic")
@@ -45,11 +46,13 @@ RESPEAKER_DISABLE_HPF = True
 #Camera Physical Limits & Calibration
 MOVE_SPEED = 0.65
 MIN_ANGLE = -170.0              
-MAX_ANGLE = 170.0               
+MAX_ANGLE = 170.0  
+PAN_TIME_END_TO_END = 26            
 TIME_PER_DEGREE = 0.075
 
 # Tilt Scanning settings
-DEFAULT_ELEVATION_ANGLE = 60
+DEFAULT_ELEVATION_ANGLE = 45
+
 MIN_TILT = 5.0
 MAX_TILT = 45.0
 TILT_RANGE_SOFTWARE = 85.0
