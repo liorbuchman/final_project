@@ -13,26 +13,26 @@ RTSP_URL = "rtsp://admin:admin@192.168.1.90:554/live/ch0"
 CAMERA_IP = '192.168.1.90'
 CAMERA_USER = 'admin'
 CAMERA_PASS = 'admin'
-YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "model_v5.pt")
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
-YOLO_CONF_THRESHOLD = 0.6
+YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "best.pt")
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+YOLO_CONF_THRESHOLD = 0.5
 
 # --- Acoustic Settings ---
 AUDIO_MODEL_DIR = os.path.join(BASE_DIR, "uav_acoustic")
 IDVENDOR = 0x2886
 IDPRODUCT = 0x0018
 AUDIO_CHANNEL = 0
-AUDIO_CLASSIFICATION_THRESHOLD = 0.8
+AUDIO_CLASSIFICATION_THRESHOLD = 0.65
 SAMPLE_RATE = 16000
 WINDOW_SECS = 1.0
 STEP_SECS = 0.2
 RESPEAKER_INDEX = 1
 SMOOTHING_WINDOW = 1
 ENABLE_ENERGY_GATE = True
-AUDIO_MIN_RMS_THRESHOLD = 0.02 #enrgey lower threshod -> going to be zero
+AUDIO_MIN_RMS_THRESHOLD = 0.025 #enrgey lower threshod -> going to be zero
 DOA_SMOOTHING_ALPHA = 0.35         
-DOA_MAX_JUMP_DEG = 45.0             
+DOA_MAX_JUMP_DEG = 30.0             
 
 #dsp card function  
 RESPEAKER_TUNE_DSP = True #endable DSP tuning for ReSpeaker V3.1
@@ -43,20 +43,21 @@ RESPEAKER_DISABLE_HPF = True
 
 
 #Camera Physical Limits & Calibration
-MOVE_SPEED = 0.5
+MOVE_SPEED = 0.65
 MIN_ANGLE = -170.0              
 MAX_ANGLE = 170.0               
-TIME_PER_DEGREE = 0.0749
+TIME_PER_DEGREE = 0.075
 
 # Tilt Scanning settings
+DEFAULT_ELEVATION_ANGLE = 60
 MIN_TILT = 5.0
 MAX_TILT = 45.0
 TILT_RANGE_SOFTWARE = 85.0
-TILT_TIME_END_TO_END = 7.0
+TILT_TIME_END_TO_END = 12
 TIME_PER_DEGREE_TILT = TILT_TIME_END_TO_END / TILT_RANGE_SOFTWARE
 
 # --- FSM Tactical Timeouts & Visual Tracking ---
-TARGET_LOST_TIMEOUT = 3.0
+TARGET_LOST_TIMEOUT = 4
 VISUAL_LOCK_COOLDOWN = 1.5
 KP_PAN = 0.0015
 KP_TILT = -0.0015

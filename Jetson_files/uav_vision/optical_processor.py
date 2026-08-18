@@ -32,6 +32,8 @@ class OpticalDetector:
 
     def run_inference(self, frame):
         """Processes 640x480 frame matrices on GPU and extracts spatial target center errors."""
+        #logging.info(f"[DEBUG] Frame shape before YOLO: {frame.shape}")
+        cv2.imwrite("what_yolo_actually_sees.jpg", frame)
         results = self.model(frame, stream=False, conf=config.YOLO_CONF_THRESHOLD, verbose=False)
         self.visual_lock = False
         
@@ -39,6 +41,9 @@ class OpticalDetector:
             if len(r.boxes) > 0:
                 self.visual_lock = True
                 box = r.boxes[0]
+                yolo_conf = float(box.conf[0])
+                yolo_conf_percent = int(yolo_conf * 100)
+                logging.info(f"[YOLO] Drone visually detected! Visual Confidence: {yolo_conf:.2f}")
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 
                 center_x = (x1 + x2) // 2
@@ -49,7 +54,13 @@ class OpticalDetector:
                 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
+
+                label = f"Drone: {yolo_conf_percent}%"
                 
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                text_position = (x1, max(y1 - 10, 10)) 
+                
+                cv2.putText(frame, label, text_position, font, 0.6, (255, 255, 255), 2)
                 # Lock onto the first (highest confidence) target
                 break 
         
@@ -124,7 +135,7 @@ class OpticalDetector:
         
         # Calculate delta
         diff = safe_target - self.current_camera_pan
-        direction = "Right" if diff > 0 else "Left" if diff < 0 else "None"
+        direction = "Left" if diff > 0 else "Right" if diff < 0 else "None"
         degrees_to_move = abs(diff)
         
         return direction, safe_target, degrees_to_move
@@ -186,61 +197,99 @@ class OpticalDetector:
             return
 
         # ==========================================
-        # STEP 2: VERTICAL SCAN (TILT SWEEP)
+        # STEP 2: MOVE TILT TO FIXED MIDDLE ELEVATION
         # ==========================================
-        logging.info("[Optical] Initiating Vertical Scan...")
-        current_tilt = config.MIN_TILT
-        scan_step = 20.0
-        direction_tilt = "Up"
-        time_per_step = scan_step * config.TIME_PER_DEGREE_TILT
+        # Target angle: DEFAULT_ELEVATION_ANGLE or midpoint between MIN_TILT and MAX_TILT
+        target_tilt = getattr(config, 'DEFAULT_ELEVATION_ANGLE', (config.MIN_TILT + config.MAX_TILT) / 2.0)
+        current_tilt_val = getattr(self, 'current_tilt', config.MIN_TILT)
+        tilt_diff = target_tilt - current_tilt_val
 
-        # 2A. Reset Tilt to the bottom limit before scanning
-        logging.info("[Optical] Resetting tilt to bottom limit...")
-        self.track_target(0.0, -config.MOVE_SPEED) # Send motor DOWN
-        
-        if self._sleep_and_check_lock(config.TILT_TIME_END_TO_END):
-            stop_camera(self.ptz, self.move_req)
-            logging.info("[Optical] Target detected while resetting tilt!")
-            return
-        stop_camera(self.ptz, self.move_req)
+        if abs(tilt_diff) >= 2.0:
+            logging.info(f"[Optical] Moving TILT to fixed middle elevation ({target_tilt}°)...")
+            
+            y_speed = config.MOVE_SPEED if tilt_diff > 0 else -config.MOVE_SPEED
+            time_to_tilt = abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
 
-        # 2B. Execute step-by-step vertical scan
-        # Limited to 20 sweeps to prevent infinite loop if drone flies away
-        max_scan_sweeps = 8
-        for _ in range(max_scan_sweeps):
-            # Pre-check visual lock
-            if self.visual_lock:
-                break
-                
-            logging.info(f"[Optical] Scanning at {current_tilt} degrees...")
-            
-            # Determine motor direction for this step
-            y_speed = config.MOVE_SPEED if direction_tilt == "Up" else -config.MOVE_SPEED
-            
-            # Start tilt motor
+            # Start Tilt motor directly to the center angle
             self.track_target(0.0, y_speed)
-            
-            # Wait for step to finish, abort immediately if YOLO sees the drone
-            target_found = self._sleep_and_check_lock(time_per_step)
+            target_found_during_tilt = self._sleep_and_check_lock(time_to_tilt)
+
             stop_camera(self.ptz, self.move_req)
-            
-            if target_found:
-                logging.info(f"*** TARGET VISUALLY ACQUIRED at ~{current_tilt} degrees! ***")
-                break
-                
-            # Update math for next step
-            if direction_tilt == "Up":
-                current_tilt += scan_step
-            else:
-                current_tilt -= scan_step
-                
-            # Change direction at bounds (Bounce effect)
-            if current_tilt >= config.MAX_TILT:
-                direction_tilt = "Down"
-                current_tilt = config.MAX_TILT
-            elif current_tilt <= config.MIN_TILT:
-                direction_tilt = "Up"
-                current_tilt = config.MIN_TILT
-                
-        # Ensure motor is stopped when scan finishes or aborts
+            self.current_tilt = target_tilt
+
+            if target_found_during_tilt:
+                logging.info("[Optical] Target detected while moving Tilt to center!")
+                return
+
+        # ==========================================
+        # STEP 3: STATIONARY STARE (VERIFY YOLO DETECTION)
+        # ==========================================
+        logging.info(f"[Optical] Camera stationary at Pan: {safe_target}°, Tilt: {target_tilt}°. Waiting for YOLO lock...")
         stop_camera(self.ptz, self.move_req)
+
+        # Stand completely still for 1.5 seconds to let focus & GStreamer buffer settle, checking YOLO continuously
+        target_acquired = self._sleep_and_check_lock(1.5)
+
+        if target_acquired:
+            logging.info("*** TARGET VISUALLY ACQUIRED BY YOLO! ***")
+        else:
+            logging.info("[Optical] Stationary check finished - No visual lock acquired.")
+        # # ==========================================
+        # # STEP 2: VERTICAL SCAN (TILT SWEEP)
+        # # ==========================================
+        # logging.info("[Optical] Initiating Vertical Scan...")
+        # current_tilt = config.MIN_TILT
+        # scan_step = 20.0
+        # direction_tilt = "Up"
+        # time_per_step = scan_step * config.TIME_PER_DEGREE_TILT
+
+        # # 2A. Reset Tilt to the bottom limit before scanning
+        # logging.info("[Optical] Resetting tilt to bottom limit...")
+        # self.track_target(0.0, -config.MOVE_SPEED) # Send motor DOWN
+        
+        # if self._sleep_and_check_lock(config.TILT_TIME_END_TO_END):
+        #     stop_camera(self.ptz, self.move_req)
+        #     logging.info("[Optical] Target detected while resetting tilt!")
+        #     return
+        # stop_camera(self.ptz, self.move_req)
+
+        # # 2B. Execute step-by-step vertical scan
+        # # Limited to 20 sweeps to prevent infinite loop if drone flies away
+        # max_scan_sweeps = 5
+        # for _ in range(max_scan_sweeps):
+        #     # Pre-check visual lock
+        #     if self.visual_lock:
+        #         break
+                
+        #     logging.info(f"[Optical] Scanning at {current_tilt} degrees...")
+            
+        #     # Determine motor direction for this step
+        #     y_speed = config.MOVE_SPEED if direction_tilt == "Up" else -config.MOVE_SPEED
+            
+        #     # Start tilt motor
+        #     self.track_target(0.0, y_speed)
+            
+        #     # Wait for step to finish, abort immediately if YOLO sees the drone
+        #     target_found = self._sleep_and_check_lock(time_per_step)
+        #     stop_camera(self.ptz, self.move_req)
+            
+        #     if target_found:
+        #         logging.info(f"*** TARGET VISUALLY ACQUIRED at ~{current_tilt} degrees! ***")
+        #         break
+                
+        #     # Update math for next step
+        #     if direction_tilt == "Up":
+        #         current_tilt += scan_step
+        #     else:
+        #         current_tilt -= scan_step
+                
+        #     # Change direction at bounds (Bounce effect)
+        #     if current_tilt >= config.MAX_TILT:
+        #         direction_tilt = "Down"
+        #         current_tilt = config.MAX_TILT
+        #     elif current_tilt <= config.MIN_TILT:
+        #         direction_tilt = "Up"
+        #         current_tilt = config.MIN_TILT
+                
+        # # Ensure motor is stopped when scan finishes or aborts
+        # stop_camera(self.ptz, self.move_req)
