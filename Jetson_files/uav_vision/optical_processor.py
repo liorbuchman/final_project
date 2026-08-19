@@ -77,12 +77,12 @@ class OpticalDetector:
 
         # 3. Home Tilt to Default Elevation 
         self.track_target(0.0, -config.MOVE_SPEED)
-        degrees_down = config.MAX_TILT - config.DEFAULT_ELEVATION_ANGLE
+        degrees_down = abs(config.MAX_TILT - config.DEFAULT_ELEVATION_ANGLE)
         time.sleep(degrees_down * config.TIME_PER_DEGREE_TILT)
         stop_camera(self.ptz, self.move_req)
         self.current_tilt = config.DEFAULT_ELEVATION_ANGLE
 
-        logging.info("[Calibration] HOMING COMPLETE! Camera centered at (0°, 25°).")
+        logging.info("[Calibration] HOMING COMPLETE! Camera centered at (0°, 60°).")
         return True
     
     def initialize_hardware(self):

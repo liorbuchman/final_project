@@ -60,7 +60,7 @@ _latest_fps = 0.0
 _latest_vision_confidence = 0.0
 _latest_acoustic_confidence = 0.0
 
-defense_grid = None  # set by activate() on success; live IntegratedDroneDefenseSystem instance
+DroneSystem = None  # set by activate() on success; live IntegratedDroneDefenseSystem instance
 _config_module = None
 _activated = False
 
@@ -128,7 +128,7 @@ def activate() -> bool:
     """Brings the real hardware stack online in this process. Returns True
     on success. Never raises - any failure (missing deps, not on a Jetson)
     leaves the caller free to fall back to the simulated pipelines."""
-    global defense_grid, _config_module, _activated
+    global DroneSystem, _config_module, _activated
     if _activated:
         return True
 
@@ -153,11 +153,11 @@ def activate() -> bool:
     _patch_vision_confidence(OpticalDetector)
 
     _config_module = jetson_config
-    defense_grid = main_system.IntegratedDroneDefenseSystem()
-    threading.Thread(target=defense_grid.start_defense_grid, daemon=True, name="DefenseGridThread").start()
+    DroneSystem = main_system.ComrandInBattle()
+    threading.Thread(target= DroneSystem.initialize_system, daemon=True, name="DroneSystemThread").start()
 
     _activated = True
-    logger.info("Hardware bridge activated - IntegratedDroneDefenseSystem running live")
+    logger.info("Hardware bridge activated - ComrandInBattle running live")
     return True
 
 
@@ -174,17 +174,17 @@ def get_vision_fps() -> float:
 
 
 def get_camera_ok() -> bool:
-    if defense_grid is None:
+    if DroneSystem is None:
         return False
-    with defense_grid.data_lock:
-        return defense_grid.optical_hw_status == "ONLINE"
+    with DroneSystem.data_lock:
+        return DroneSystem.optical_hw_status == "ONLINE"
 
 
 def get_mic_ok() -> bool:
-    if defense_grid is None:
+    if DroneSystem is None:
         return False
-    with defense_grid.data_lock:
-        return defense_grid.acoustic_hw_status == "ONLINE"
+    with DroneSystem.data_lock:
+        return DroneSystem.acoustic_hw_status == "ONLINE"
 
 
 def get_fsm_state() -> str:
@@ -192,12 +192,12 @@ def get_fsm_state() -> str:
     the dashboard's own simulated FSM.tick() - main_system.py owns the
     authoritative state. DEGRADED (a GUI-only concept) is derived from the
     hardware status flags, same semantics as the simulated path."""
-    if defense_grid is None:
+    if DroneSystem is None:
         return "IDLE"
-    with defense_grid.data_lock:
-        raw_state = defense_grid.state.name
-        cam_ok = defense_grid.optical_hw_status == "ONLINE"
-        mic_ok = defense_grid.acoustic_hw_status == "ONLINE"
+    with DroneSystem.data_lock:
+        raw_state = DroneSystem.state.name
+        cam_ok = DroneSystem.optical_hw_status == "ONLINE"
+        mic_ok = DroneSystem.acoustic_hw_status == "ONLINE"
     if not cam_ok or not mic_ok:
         return "DEGRADED"
     return _STATE_NAME_MAP.get(raw_state, raw_state)
@@ -235,10 +235,10 @@ class HardwareVisionPipeline:
             _config_module.YOLO_CONF_THRESHOLD = yolo_threshold
 
     def latest_result(self):
-        if not get_camera_ok() or defense_grid is None:
+        if not get_camera_ok() or DroneSystem is None:
             return None
-        with defense_grid.data_lock:
-            visual_lock = defense_grid.visual_lock_acquired
+        with DroneSystem.data_lock:
+            visual_lock = DroneSystem.visual_lock_acquired
         conf = round(_latest_vision_confidence, 3)
         dets = [self._VisionDetection(cls="drone", conf=conf, bbox=[0, 0, 0, 0], azimuth_deg=0.0)] if visual_lock else []
         return self._VisionResult(confidence=conf, detections=dets, sensor_ts=time.time())
@@ -276,10 +276,10 @@ class HardwareAudioPipeline:
             _config_module.AUDIO_CLASSIFICATION_THRESHOLD = audio_threshold
 
     def latest_result(self):
-        if not get_mic_ok() or defense_grid is None:
+        if not get_mic_ok() or DroneSystem is None:
             return None
-        with defense_grid.data_lock:
-            doa = defense_grid.acoustic_azimuth
+        with DroneSystem.data_lock:
+            doa = DroneSystem.acoustic_azimuth
         conf = round(_latest_acoustic_confidence, 3)
         return self._AudioResult(
             confidence=conf,
