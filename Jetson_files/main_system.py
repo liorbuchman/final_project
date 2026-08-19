@@ -61,7 +61,7 @@ class ComrandInBattle:
 
         # Unique timestamped log filename for the current session
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file_name = f"integrated_system_{current_time}.log"
+        log_file_name = f"FullSystem_{current_time}.log"
         log_file_path = os.path.join(system_logs_dir, log_file_name)
 
         # Configure root logger to capture logs from all subsystems and stdout
@@ -75,6 +75,7 @@ class ComrandInBattle:
             force=True
         )
         logging.info("--- INTEGRATED TACTICAL DRONE DEFENSE GRID ONLINE ---")
+        
     def initialize_system(self):
         """Initializes hardware contexts and spawns concurrent subsystem threads."""
         self.init_logging()
