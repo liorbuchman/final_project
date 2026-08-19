@@ -92,7 +92,7 @@ class ComrandInBattle:
         # Initialize ONVIF camera
         try:
             self.video_processor.initialize_hardware()
-            self.video_processor.auto_calibrate_and_home()
+            #self.video_processor.auto_calibrate_and_home()
             if getattr(self.video_processor, 'ptz', None) is None:
                 self.optical_hw_status = "UNAVAILABLE"
         except Exception as video_err:

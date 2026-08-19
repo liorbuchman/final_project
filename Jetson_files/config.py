@@ -45,8 +45,8 @@ RESPEAKER_DISABLE_HPF = True
 
 #Camera Physical Limits & Calibration
 MOVE_SPEED = 0.75
-MIN_ANGLE = -175.0              
-MAX_ANGLE = 175.0  
+MIN_ANGLE = -180.0              
+MAX_ANGLE = 180.0  
 PAN_TIME_END_TO_END = 26            
 TIME_PER_DEGREE = 0.075
 

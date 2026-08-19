@@ -98,7 +98,7 @@ class OpticalDetector:
         """Processes 640x480 frame matrices on GPU and extracts spatial target center errors."""
         #logging.info(f"[DEBUG] Frame shape before YOLO: {frame.shape}")
         cv2.imwrite("what_yolo_actually_sees.jpg", frame)
-        results = self.model.track(frame, stream=False, persist=True, tracker="bytetrack.yaml", conf=config.YOLO_LOW_CONF_THRESHOLD, verbose=False)
+        results = self.model.track(frame, stream=False, persist=True, tracker="bytetrack.yaml", half=True, conf=config.YOLO_LOW_CONF_THRESHOLD, verbose=False)
         detected_this_frame = False
         
         for r in results:
@@ -285,7 +285,7 @@ class OpticalDetector:
         # ==========================================
         # Assuming an effective vertical FOV of ~45 degrees.
         # We only need 3 stops to cover from 0 to 90 degrees.
-        tilt_checkpoints = [20.0, 45.0, 75.0] 
+        tilt_checkpoints = [20.0, 40.0, 80.0] 
         
         logging.info("[Optical] Initiating Optimized Vertical Macro-Scan...")
 
