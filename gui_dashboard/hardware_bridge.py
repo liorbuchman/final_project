@@ -1,6 +1,6 @@
 """
 hardware_bridge.py — connects the FastAPI dashboard to the live
-IntegratedDroneDefenseSystem running in Jetson_files/main_system.py.
+ComrandInBattle running in Jetson_files/main_system.py.
 
 Zero edits to anything under Jetson_files/. Every hook is a runtime
 monkey-patch applied from this module only, each one *wrapping* the
@@ -48,8 +48,11 @@ JETSON_FILES_DIR = Path(__file__).resolve().parent.parent / "Jetson_files"
 SPEC_ROWS = 64
 SPEC_COLS = 48
 
-# FSM state names main_system.py doesn't use verbatim - only the rename the
-# frontend already understands (SPEC.md §5); SLEWING/TRACKING/ENGAGED match as-is.
+# FSM state names main_system.py doesn't use verbatim. The live SystemState
+# enum only has SCANNING/TRACKING/ENGAGED (no SLEWING - the new TRACKING state
+# covers both "slewing to the acoustic DOA" and "visually scanning" at once);
+# TRACKING/ENGAGED already match the frontend's vocabulary (SPEC.md §5) as-is,
+# so only SCANNING needs a rename. SLEWING simply never occurs in hardware mode.
 _STATE_NAME_MAP = {"SCANNING": "SEARCHING"}
 
 _state_lock = threading.Lock()
@@ -60,9 +63,17 @@ _latest_fps = 0.0
 _latest_vision_confidence = 0.0
 _latest_acoustic_confidence = 0.0
 
-DroneSystem = None  # set by activate() on success; live IntegratedDroneDefenseSystem instance
+DroneSystem = None  # set by activate() on success; live ComrandInBattle instance
 _config_module = None
 _activated = False
+
+# --- Rolling raw-audio buffer for the acoustic sample recorder ---
+# Always holds the last AUDIO_RING_MAX_S seconds of the single channel the
+# acoustic CNN itself classifies (config.AUDIO_CHANNEL), fed from the same
+# raw_buffer process_audio_buffer() already receives - no new hook needed.
+AUDIO_RING_MAX_S = 5.0
+_audio_lock = threading.Lock()
+_audio_ring: Optional[np.ndarray] = None
 
 
 def _patch_video_capture():
@@ -84,7 +95,9 @@ def _patch_video_capture():
 def _patch_acoustic_confidence(acoustic_detector_cls):
     """process_audio_buffer already computes and returns a live confidence
     score every audio chunk; main_system.py's acoustic_background_loop just
-    never captures it. Wrap, don't touch the DSP/CNN logic itself."""
+    never captures it. Wrap, don't touch the DSP/CNN logic itself. Also feeds
+    the rolling audio ring buffer from the same raw_buffer, for the acoustic
+    sample recorder - one extra read, no new hook into main_system.py."""
     original = acoustic_detector_cls.process_audio_buffer
 
     def wrapped(self, raw_buffer):
@@ -92,34 +105,90 @@ def _patch_acoustic_confidence(acoustic_detector_cls):
         global _latest_acoustic_confidence
         with _state_lock:
             _latest_acoustic_confidence = float(score)
+        _update_audio_ring(raw_buffer)
         return score
 
     acoustic_detector_cls.process_audio_buffer = wrapped
 
 
+def _update_audio_ring(raw_buffer):
+    """main_system.py's own ring_buffer (raw_buffer here) is a sliding window
+    that only advances by step_samples each call - the newest audio is always
+    its last step_samples rows. Append just that into our own longer,
+    independent ring so a 1-5s clip can be sliced out later regardless of the
+    model's own (fixed, shorter) inference window."""
+    global _audio_ring
+    if _config_module is None:
+        return
+    channel = getattr(_config_module, "AUDIO_CHANNEL", 0)
+    sample_rate = getattr(_config_module, "SAMPLE_RATE", 16000)
+    step_s = getattr(_config_module, "STEP_SECS", 0.2)
+    step_samples = max(1, int(sample_rate * step_s))
+
+    try:
+        newest = raw_buffer[-step_samples:, channel].astype(np.int16)
+    except Exception:
+        return
+
+    ring_len = int(AUDIO_RING_MAX_S * sample_rate)
+    with _audio_lock:
+        if _audio_ring is None or len(_audio_ring) != ring_len:
+            _audio_ring = np.zeros(ring_len, dtype=np.int16)
+        n = min(len(newest), ring_len)
+        _audio_ring = np.roll(_audio_ring, -n)
+        _audio_ring[-n:] = newest[-n:]
+
+
+def get_audio_window(seconds: float) -> Optional[np.ndarray]:
+    """Returns the last `seconds` (clamped to AUDIO_RING_MAX_S) of raw mono
+    int16 audio - the same channel the acoustic CNN itself classifies. None
+    if no audio has flowed through process_audio_buffer yet."""
+    if _config_module is None or _audio_ring is None:
+        return None
+    sample_rate = getattr(_config_module, "SAMPLE_RATE", 16000)
+    n = max(1, int(min(seconds, AUDIO_RING_MAX_S) * sample_rate))
+    with _audio_lock:
+        n = min(n, len(_audio_ring))
+        return _audio_ring[-n:].copy()
+
+
+def get_audio_sample_rate() -> int:
+    if _config_module is None:
+        return 16000
+    return getattr(_config_module, "SAMPLE_RATE", 16000)
+
+
 def _patch_vision_confidence(optical_detector_cls):
-    """Taps the YOLO model's own call so run_inference's thresholding,
-    box-drawing, and visual_lock logic all run completely untouched - this
-    only reads the confidence already computed for the frame about to be
-    returned. Applied after initialize_hardware's real ONVIF+YOLO setup
-    finishes, since self.model doesn't exist before that."""
+    """Taps the YOLO model's own track() call so run_inference's hysteresis
+    (YOLO_LOW/HIGH_CONF_THRESHOLD lock-hold logic), box-drawing, and
+    visual_lock all run completely untouched - this only reads the confidence
+    already computed for the frame about to be returned. Applied after
+    initialize_hardware's real ONVIF+YOLO setup finishes, since self.model
+    doesn't exist before that.
+
+    run_inference() calls self.model.track(frame, stream=False, ...), which
+    returns a plain list of Results (not a generator like a bare model call
+    would) - wrap that specific method, not __call__, and mirror exactly
+    what run_inference itself reads (first box of the first result)."""
     original_init = optical_detector_cls.initialize_hardware
 
     def patched_init(self):
         original_init(self)
         if self.model is None:
             return
-        original_call = self.model.__call__
+        original_track = self.model.track
 
-        def wrapped_call(frame, **kwargs):
-            for r in original_call(frame, **kwargs):
-                conf = float(r.boxes.conf.max().item()) if len(r.boxes) > 0 else 0.0
-                global _latest_vision_confidence
-                with _state_lock:
-                    _latest_vision_confidence = conf
-                yield r
+        def wrapped_track(source, **kwargs):
+            results = original_track(source, **kwargs)
+            conf = 0.0
+            if results and len(results[0].boxes) > 0:
+                conf = float(results[0].boxes.conf[0].item())
+            global _latest_vision_confidence
+            with _state_lock:
+                _latest_vision_confidence = conf
+            return results
 
-        self.model.__call__ = wrapped_call
+        self.model.track = wrapped_track
 
     optical_detector_cls.initialize_hardware = patched_init
 
@@ -187,8 +256,35 @@ def get_mic_ok() -> bool:
         return DroneSystem.acoustic_hw_status == "ONLINE"
 
 
+def get_camera_pan_deg() -> float:
+    """Live PTZ pan angle, mirrored from OpticalDetector's own open-loop
+    position tracking (current_camera_pan) - drives the GUI's compass strip
+    (camera bearing vs acoustic DOA). Not lock-protected in main_system.py
+    itself (a plain float attribute), but a single read is GIL-safe, same as
+    the other unprotected attributes this bridge already reads."""
+    if DroneSystem is None:
+        return 0.0
+    try:
+        return float(getattr(DroneSystem.video_processor, "current_camera_pan", 0.0))
+    except Exception:
+        return 0.0
+
+
+def get_camera_pan_range():
+    """(min_deg, max_deg) mechanical pan limits, read from Jetson_files/config.py
+    (MIN_ANGLE/MAX_ANGLE) rather than hardcoded, so editing those constants and
+    restarting the server is all that's needed to change what the GUI's
+    compass strip displays - no frontend change required. Falls back to a
+    generic +/-90 deg when running without the hardware config loaded."""
+    if _config_module is None:
+        return (-90.0, 90.0)
+    lo = getattr(_config_module, "MIN_ANGLE", -90.0)
+    hi = getattr(_config_module, "MAX_ANGLE", 90.0)
+    return (float(lo), float(hi))
+
+
 def get_fsm_state() -> str:
-    """Mirrors the live IntegratedDroneDefenseSystem FSM instead of running
+    """Mirrors the live ComrandInBattle FSM instead of running
     the dashboard's own simulated FSM.tick() - main_system.py owns the
     authoritative state. DEGRADED (a GUI-only concept) is derived from the
     hardware status flags, same semantics as the simulated path."""
@@ -227,12 +323,14 @@ class HardwareVisionPipeline:
     def fps(self) -> float:
         return get_vision_fps()
 
-    def update_params(self, yolo_threshold: float, nms_threshold: float, draw_boxes: bool) -> None:
-        # Only the threshold is simply supported today; NMS and draw_boxes
+    def update_params(self, yolo_threshold_low: float, yolo_threshold_high: float, nms_threshold: float, draw_boxes: bool) -> None:
+        # Only the two thresholds are simply supported today (they drive the
+        # real hysteresis lock-hold in run_inference()); NMS and draw_boxes
         # have no live hook (the box is burned into the frame unconditionally
         # by the untouched run_inference()) and are intentionally ignored.
         if _config_module is not None:
-            _config_module.YOLO_CONF_THRESHOLD = yolo_threshold
+            _config_module.YOLO_LOW_CONF_THRESHOLD = yolo_threshold_low
+            _config_module.YOLO_HIGH_CONF_THRESHOLD = yolo_threshold_high
 
     def latest_result(self):
         if not get_camera_ok() or DroneSystem is None:

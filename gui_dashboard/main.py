@@ -19,6 +19,7 @@ import math
 import os
 import random
 import time
+import wave
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -57,7 +58,8 @@ logger.setLevel(logging.DEBUG)
 # --------------------------------------------------------------------------
 
 SETTINGS_BOUNDS = {
-    "yolo_threshold": (0.0, 1.0),
+    "yolo_threshold_low": (0.0, 1.0),
+    "yolo_threshold_high": (0.0, 1.0),
     "audio_threshold": (0.0, 1.0),
     "fusion_window_ms": (100, 2000),
     "audio_gain": (1.0, 10.0),
@@ -69,7 +71,8 @@ SETTINGS_BOUNDS = {
 
 DEFAULT_SETTINGS = {
     "system_active": False,
-    "yolo_threshold": 0.55,
+    "yolo_threshold_low": 0.25,
+    "yolo_threshold_high": 0.5,
     "audio_threshold": 0.70,
     "fusion_window_ms": 500,
     "audio_gain": 2.5,
@@ -176,7 +179,7 @@ class VisionPipeline(Protocol):
     def stop(self) -> None: ...
     def latest_frame(self) -> Optional[bytes]: ...
     def latest_result(self) -> Optional[VisionResult]: ...
-    def update_params(self, yolo_threshold: float, nms_threshold: float, draw_boxes: bool) -> None: ...
+    def update_params(self, yolo_threshold_low: float, yolo_threshold_high: float, nms_threshold: float, draw_boxes: bool) -> None: ...
 
 
 class AudioPipeline(Protocol):
@@ -192,9 +195,14 @@ CAMERA_FOV_DEG = 90.0
 MIC_ARRAY_RESOLUTION_DEG = 15.0  # +/- => 30 deg sector
 
 
-def render_vision_frame(cx, cy, size, conf, yolo_threshold, draw_boxes, label_text, visible_margin=0.15):
+def render_vision_frame(cx, cy, size, conf, yolo_threshold_low, yolo_threshold_high, draw_boxes, label_text, visible_margin=0.15):
     """Shared JPEG renderer used by both the simulated and replay vision
-    pipelines, so a recorded bbox reproduces pixel-identical output later."""
+    pipelines, so a recorded bbox reproduces pixel-identical output later.
+
+    Mirrors the real hardware's two-stage hysteresis concept (YOLO_LOW/HIGH_
+    CONF_THRESHOLD in Jetson_files/config.py): a dim "candidate" circle once
+    confidence clears the low threshold, a solid confirmed box + label only
+    once it clears the high threshold."""
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     frame[:] = (18, 18, 22)
     for gx in range(0, 640, 80):
@@ -204,10 +212,11 @@ def render_vision_frame(cx, cy, size, conf, yolo_threshold, draw_boxes, label_te
     cv2.putText(frame, label_text, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (90, 200, 90), 1, cv2.LINE_AA)
     cv2.putText(frame, time.strftime("%H:%M:%S"), (520, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 150), 1, cv2.LINE_AA)
 
-    if cx is not None and conf >= yolo_threshold - visible_margin:
-        color = (60, 200, 255) if conf >= yolo_threshold else (90, 90, 110)
+    if cx is not None and conf >= yolo_threshold_low - visible_margin:
+        confirmed = conf >= yolo_threshold_high
+        color = (60, 200, 255) if confirmed else (90, 90, 110)
         cv2.circle(frame, (int(cx), int(cy)), max(1, int(size / 2)), color, 2, cv2.LINE_AA)
-        if draw_boxes and conf >= yolo_threshold:
+        if draw_boxes and confirmed:
             half = int(size / 2)
             p1 = (int(cx - half), int(cy - half))
             p2 = (int(cx + half), int(cy + half))
@@ -228,7 +237,8 @@ class SimulatedVisionPipeline:
         self.fps = 0.0
         self._running = False
         self._t0 = 0.0
-        self._yolo_threshold = DEFAULT_SETTINGS["yolo_threshold"]
+        self._yolo_threshold_low = DEFAULT_SETTINGS["yolo_threshold_low"]
+        self._yolo_threshold_high = DEFAULT_SETTINGS["yolo_threshold_high"]
         self._nms_threshold = DEFAULT_SETTINGS["nms_threshold"]
         self._draw_boxes = DEFAULT_SETTINGS["draw_boxes"]
         self._frame_count = 0
@@ -246,8 +256,9 @@ class SimulatedVisionPipeline:
         self.connected = False
         self.fps = 0.0
 
-    def update_params(self, yolo_threshold: float, nms_threshold: float, draw_boxes: bool) -> None:
-        self._yolo_threshold = yolo_threshold
+    def update_params(self, yolo_threshold_low: float, yolo_threshold_high: float, nms_threshold: float, draw_boxes: bool) -> None:
+        self._yolo_threshold_low = yolo_threshold_low
+        self._yolo_threshold_high = yolo_threshold_high
         self._nms_threshold = nms_threshold
         self._draw_boxes = draw_boxes
 
@@ -268,7 +279,7 @@ class SimulatedVisionPipeline:
         t = time.time() - self._t0
         x, y, conf, azimuth, size = self._sim_target(t)
         dets = []
-        if conf >= self._yolo_threshold:
+        if conf >= self._yolo_threshold_low:
             bbox = [int(x - size / 2), int(y - size / 2), int(size), int(size)]
             dets.append(VisionDetection(cls="drone", conf=round(conf, 3), bbox=bbox, azimuth_deg=round(azimuth, 1)))
         return VisionResult(confidence=round(conf, 3), detections=dets, sensor_ts=time.time())
@@ -278,7 +289,7 @@ class SimulatedVisionPipeline:
             return None
         t = time.time() - self._t0
         x, y, conf, azimuth, size = self._sim_target(t)
-        frame_bytes = render_vision_frame(x, y, size, conf, self._yolo_threshold, self._draw_boxes, "SIMULATED FEED")
+        frame_bytes = render_vision_frame(x, y, size, conf, self._yolo_threshold_low, self._yolo_threshold_high, self._draw_boxes, "SIMULATED FEED")
         if frame_bytes is None:
             return None
         self._frame_count += 1
@@ -446,7 +457,8 @@ class ReplayVisionPipeline:
         self.connected = False
         self.fps = 15.0
         self._running = False
-        self._yolo_threshold = DEFAULT_SETTINGS["yolo_threshold"]
+        self._yolo_threshold_low = DEFAULT_SETTINGS["yolo_threshold_low"]
+        self._yolo_threshold_high = DEFAULT_SETTINGS["yolo_threshold_high"]
         self._draw_boxes = DEFAULT_SETTINGS["draw_boxes"]
 
     def start(self) -> None:
@@ -457,8 +469,9 @@ class ReplayVisionPipeline:
         self._running = False
         self.connected = False
 
-    def update_params(self, yolo_threshold: float, nms_threshold: float, draw_boxes: bool) -> None:
-        self._yolo_threshold = yolo_threshold
+    def update_params(self, yolo_threshold_low: float, yolo_threshold_high: float, nms_threshold: float, draw_boxes: bool) -> None:
+        self._yolo_threshold_low = yolo_threshold_low
+        self._yolo_threshold_high = yolo_threshold_high
         self._draw_boxes = draw_boxes
 
     def latest_result(self) -> Optional[VisionResult]:
@@ -486,7 +499,7 @@ class ReplayVisionPipeline:
         else:
             cx = cy = None
             size = 0
-        return render_vision_frame(cx, cy, size, conf, self._yolo_threshold, self._draw_boxes, "REPLAY FEED")
+        return render_vision_frame(cx, cy, size, conf, self._yolo_threshold_low, self._yolo_threshold_high, self._draw_boxes, "REPLAY FEED")
 
 
 class ReplayAudioPipeline:
@@ -579,6 +592,134 @@ class RecordEngine:
             self.stop()
 
 
+class FrameRecordEngine:
+    """Saves sampled JPEG frames straight to disk for later model training -
+    deliberately separate from RecordEngine's telemetry-only recordings.
+
+    Storage math: 1280x720 JPEG q60 is roughly 80-150KB/frame; at the native
+    15 FPS that's ~4-8GB/hour, easily enough to fill a Jetson's onboard
+    storage in a single session. Sampling at a low, user-controlled interval
+    (default 1 frame/s) and capping the total frame count are the two things
+    that keep this from ever becoming a problem - both are set by the caller,
+    not hardcoded here."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.enabled = False
+        self.interval_s = 1.0
+        self.max_frames = 1200
+        self.dirname: Optional[Path] = None
+        self.frame_count = 0
+        self._last_save = 0.0
+
+    def start(self, interval_s: float = 1.0, max_frames: int = 1200) -> str:
+        self.stop()
+        self.interval_s = max(0.1, float(interval_s))
+        self.max_frames = max(1, int(max_frames))
+        self.dirname = self.directory / f"frames_{time.strftime('%Y%m%d_%H%M%S')}"
+        self.dirname.mkdir(parents=True, exist_ok=True)
+        self.frame_count = 0
+        self._last_save = 0.0
+        self.enabled = True
+        return self.dirname.name
+
+    def stop(self):
+        self.enabled = False
+
+    def maybe_save(self, jpeg_bytes: Optional[bytes]):
+        if not self.enabled or jpeg_bytes is None or self.dirname is None:
+            return
+        now = time.time()
+        if now - self._last_save < self.interval_s:
+            return
+        if self.frame_count >= self.max_frames:
+            logger.warning("Frame recording reached its %d-frame cap - stopping automatically", self.max_frames)
+            self.stop()
+            return
+        self._last_save = now
+        path = self.dirname / f"frame_{self.frame_count:06d}_{int(now * 1000)}.jpg"
+        try:
+            path.write_bytes(jpeg_bytes)
+            self.frame_count += 1
+        except OSError as exc:
+            logger.error("Frame recording write failed: %s", exc)
+            self.stop()
+
+
+class AcousticRecordEngine:
+    """Saves short mono WAV clips of the live acoustic feed for further
+    training of the acoustic model - hardware mode only (there's no real
+    audio in simulated mode). "drone/" is meant to fill automatically off
+    real trigger events; "noise/" is meant to fill manually, so the user
+    picks representative quiet/background moments themselves and keeps the
+    two classes balanced by eye (live counts are broadcast for exactly that).
+
+    Storage math: mono 16kHz WAV is ~64KB/second, so even a 5s clip is only
+    ~320KB - at max_samples=300/class that's under 200MB total, a small
+    fraction of what unrestrained video frame recording would cost."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.enabled = False           # armed: manual saves + auto-save both possible
+        self.auto_save_drone = True    # independent of `enabled` - toggle live, doesn't reset the session
+        self.window_s = 2.0
+        self.max_samples = 300
+        self.session_dir: Optional[Path] = None
+        self.drone_count = 0
+        self.noise_count = 0
+
+    def start(self, window_s: float = 2.0, max_samples: int = 300) -> str:
+        self.stop()
+        self.window_s = max(1.0, min(5.0, float(window_s)))
+        self.max_samples = max(1, int(max_samples))
+        self.session_dir = self.directory / f"acoustic_{time.strftime('%Y%m%d_%H%M%S')}"
+        (self.session_dir / "drone").mkdir(parents=True, exist_ok=True)
+        (self.session_dir / "noise").mkdir(parents=True, exist_ok=True)
+        self.drone_count = 0
+        self.noise_count = 0
+        self.enabled = True
+        return self.session_dir.name
+
+    def stop(self):
+        self.enabled = False
+
+    def set_auto_save(self, enabled: bool):
+        self.auto_save_drone = bool(enabled)
+
+    def save_sample(self, label: str):
+        """Returns (ok: bool, info: str) - info is the saved filename on
+        success, or a short reason code on failure."""
+        if label not in ("drone", "noise"):
+            return False, "bad_label"
+        if not self.enabled or self.session_dir is None:
+            return False, "not_armed"
+        count = self.drone_count if label == "drone" else self.noise_count
+        if count >= self.max_samples:
+            return False, "max_reached"
+
+        window = hardware_bridge.get_audio_window(self.window_s)
+        if window is None or len(window) == 0:
+            return False, "no_audio"
+
+        sample_rate = hardware_bridge.get_audio_sample_rate()
+        path = self.session_dir / label / f"{label}_{count:04d}_{int(time.time() * 1000)}.wav"
+        try:
+            with wave.open(str(path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # int16
+                wf.setframerate(sample_rate)
+                wf.writeframes(window.tobytes())
+        except OSError as exc:
+            logger.error("Acoustic sample write failed: %s", exc)
+            return False, "write_error"
+
+        if label == "drone":
+            self.drone_count += 1
+        else:
+            self.noise_count += 1
+        return True, path.name
+
+
 # --------------------------------------------------------------------------
 # Finite State Machine (SPEC.md §5)
 # --------------------------------------------------------------------------
@@ -625,7 +766,7 @@ class FSM:
         if self.state == "IDLE":
             self.state = "SEARCHING"
 
-        visual_hit = bool(vision and vision.detections and vision.confidence >= settings["yolo_threshold"])
+        visual_hit = bool(vision and vision.detections and vision.confidence >= settings["yolo_threshold_low"])
         acoustic_hit = bool(audio and audio.confidence >= settings["audio_threshold"])
         azimuth_agree = False
         if visual_hit and acoustic_hit:
@@ -751,12 +892,17 @@ class RuntimeState:
     prev_acoustic_hit: bool = False
     prev_state: str = "IDLE"
     record_engine: RecordEngine = field(init=False)
+    frame_record_engine: FrameRecordEngine = field(init=False)
+    acoustic_record_engine: AcousticRecordEngine = field(init=False)
     hardware_active: bool = False
+    sim_camera_pan: float = 0.0  # simulated-mode-only: fabricated PTZ bearing for demo purposes
 
     def __post_init__(self):
         self.live_vision = self.vision
         self.live_audio = self.audio
         self.record_engine = RecordEngine(RECORDINGS_DIR)
+        self.frame_record_engine = FrameRecordEngine(RECORDINGS_DIR)
+        self.acoustic_record_engine = AcousticRecordEngine(RECORDINGS_DIR)
 
 
 runtime = RuntimeState()
@@ -765,6 +911,20 @@ runtime = RuntimeState()
 def record_if_active(payload: dict):
     if runtime.hardware_active or settings_store.system_active:
         runtime.record_engine.write(payload)
+
+
+def acoustic_recording_payload() -> dict:
+    are = runtime.acoustic_record_engine
+    return {
+        "type": "acoustic_recording_state",
+        "recording": are.enabled,
+        "auto_save_drone": are.auto_save_drone,
+        "dir": are.session_dir.name if are.session_dir else None,
+        "drone_count": are.drone_count,
+        "noise_count": are.noise_count,
+        "max_samples": are.max_samples,
+        "window_s": are.window_s,
+    }
 
 
 def jetson_metrics() -> dict:
@@ -789,12 +949,17 @@ def jetson_metrics() -> dict:
 def fabricate_fused_event(sim: bool = True) -> dict:
     now = time.time()
     azimuth = round(random.uniform(-30, 30), 1)
-    conf = round(random.uniform(0.75, 0.95), 2)
+    visual_conf = round(random.uniform(0.7, 0.95), 2)
+    acoustic_conf = round(random.uniform(0.7, 0.95), 2)
+    combined_conf = round((visual_conf + acoustic_conf) / 2, 3)
     ev = {
         "ts": now,
         "modality": "Fused",
         "cls": "drone",
-        "confidence": conf,
+        "confidence": combined_conf,
+        "visual_confidence": visual_conf,
+        "acoustic_confidence": acoustic_conf,
+        "combined_confidence": combined_conf,
         "azimuth_deg": azimuth,
         "sim": sim,
     }
@@ -814,10 +979,15 @@ async def video_encode_loop():
     interval = 1.0 / VIDEO_FPS
     while True:
         try:
-            if runtime.mjpeg_clients > 0 and (runtime.hardware_active or settings_store.system_active):
+            # Normally encode only while a viewer is connected (SPEC.md §8) - but
+            # frame recording for model training must keep sampling even with the
+            # browser tab closed, so it also counts as a reason to keep encoding.
+            need_frames = runtime.mjpeg_clients > 0 or runtime.frame_record_engine.enabled
+            if need_frames and (runtime.hardware_active or settings_store.system_active):
                 frame = runtime.vision.latest_frame()
                 if frame is not None:
                     runtime.latest_jpeg = frame
+                    runtime.frame_record_engine.maybe_save(frame)
             else:
                 runtime.latest_jpeg = None
             await asyncio.sleep(interval)
@@ -826,12 +996,30 @@ async def video_encode_loop():
             await asyncio.sleep(2)
 
 
-def _record_event_if_new(modality: str, cls: str, conf: float, azimuth: float):
+def _record_event_if_new(
+    modality: str,
+    cls: str,
+    azimuth: float,
+    vision_result: Optional[VisionResult],
+    audio_result: Optional[AudioResult],
+):
+    """Builds one Detection Event History row. Captures BOTH sensors' current
+    confidence (not just whichever one triggered this event) so the table can
+    show what the other modality was reading for the same target at that
+    moment, plus a simple 50/50 combined score when both are available."""
+    visual_conf = round(vision_result.confidence, 3) if vision_result else None
+    acoustic_conf = round(audio_result.confidence, 3) if audio_result else None
+    combined_conf = round((visual_conf + acoustic_conf) / 2, 3) if (visual_conf is not None and acoustic_conf is not None) else None
+    primary_conf = {"Visual": visual_conf, "Acoustic": acoustic_conf, "Fused": combined_conf}.get(modality)
+
     ev = {
         "ts": time.time(),
         "modality": modality,
         "cls": cls,
-        "confidence": conf,
+        "confidence": primary_conf,
+        "visual_confidence": visual_conf,
+        "acoustic_confidence": acoustic_conf,
+        "combined_confidence": combined_conf,
         "azimuth_deg": azimuth,
         "sim": False,
     }
@@ -856,6 +1044,7 @@ async def telemetry_loop():
                 state = hardware_bridge.get_fsm_state()
                 camera_ok = hardware_bridge.get_camera_ok()
                 mic_ok = hardware_bridge.get_mic_ok()
+                camera_pan_deg = hardware_bridge.get_camera_pan_deg()
             else:
                 camera_ok = (not active) or runtime.vision.connected
                 mic_ok = (not active) or runtime.audio.active
@@ -868,23 +1057,29 @@ async def telemetry_loop():
                     camera_ok=camera_ok,
                     mic_ok=mic_ok,
                 )
+                # No real PTZ in simulated mode - fabricate a plausible bearing that
+                # eases toward the (also fabricated) acoustic DOA, purely so the
+                # compass strip has something meaningful to show during a demo.
+                target_doa = audio_result.doa_deg if audio_result else 0.0
+                runtime.sim_camera_pan += (target_doa - runtime.sim_camera_pan) * 0.15
+                camera_pan_deg = runtime.sim_camera_pan
 
             if state != runtime.prev_state:
                 logger.info("State transition: %s -> %s", runtime.prev_state, state)
                 if state == "ENGAGED" and vision_result and vision_result.detections:
                     ev = _record_event_if_new(
-                        "Fused", "drone", vision_result.detections[0].conf, vision_result.detections[0].azimuth_deg
+                        "Fused", "drone", vision_result.detections[0].azimuth_deg, vision_result, audio_result
                     )
                     record_if_active({"type": "event", **ev})
                     await manager.broadcast({"type": "event", **ev})
                 runtime.prev_state = state
 
             if vision_result and vision_result.detections:
-                visual_hit = vision_result.confidence >= settings_store.yolo_threshold
+                visual_hit = vision_result.confidence >= settings_store.yolo_threshold_low
                 if visual_hit and not runtime.prev_visual_hit:
                     ev = _record_event_if_new(
-                        "Visual", vision_result.detections[0].cls, vision_result.confidence,
-                        vision_result.detections[0].azimuth_deg,
+                        "Visual", vision_result.detections[0].cls, vision_result.detections[0].azimuth_deg,
+                        vision_result, audio_result,
                     )
                     record_if_active({"type": "event", **ev})
                     await manager.broadcast({"type": "event", **ev})
@@ -895,9 +1090,18 @@ async def telemetry_loop():
             if audio_result:
                 acoustic_hit = audio_result.confidence >= settings_store.audio_threshold
                 if acoustic_hit and not runtime.prev_acoustic_hit:
-                    ev = _record_event_if_new("Acoustic", "drone", audio_result.confidence, audio_result.doa_deg)
+                    ev = _record_event_if_new("Acoustic", "drone", audio_result.doa_deg, vision_result, audio_result)
                     record_if_active({"type": "event", **ev})
                     await manager.broadcast({"type": "event", **ev})
+
+                    are = runtime.acoustic_record_engine
+                    if runtime.hardware_active and are.enabled and are.auto_save_drone:
+                        ok, info = are.save_sample("drone")
+                        if ok:
+                            logger.info("Auto-saved drone acoustic sample -> %s", info)
+                            await manager.broadcast(acoustic_recording_payload())
+                        elif info != "not_armed":
+                            logger.warning("Auto-save of drone acoustic sample failed: %s", info)
                 runtime.prev_acoustic_hit = acoustic_hit
             else:
                 runtime.prev_acoustic_hit = False
@@ -925,6 +1129,20 @@ async def telemetry_loop():
                 },
                 "waveform": audio_result.waveform if audio_result else [],
                 "sensor_ts": (vision_result.sensor_ts if vision_result else (audio_result.sensor_ts if audio_result else now)),
+                "camera_pan_deg": round(camera_pan_deg, 1),
+                "frame_recording": {
+                    "active": runtime.frame_record_engine.enabled,
+                    "count": runtime.frame_record_engine.frame_count,
+                    "max_frames": runtime.frame_record_engine.max_frames,
+                    "dir": runtime.frame_record_engine.dirname.name if runtime.frame_record_engine.dirname else None,
+                },
+                "acoustic_recording": {
+                    "active": runtime.acoustic_record_engine.enabled,
+                    "auto_save_drone": runtime.acoustic_record_engine.auto_save_drone,
+                    "drone_count": runtime.acoustic_record_engine.drone_count,
+                    "noise_count": runtime.acoustic_record_engine.noise_count,
+                    "max_samples": runtime.acoustic_record_engine.max_samples,
+                },
             }
             record_if_active(payload)
             await manager.broadcast(payload)
@@ -959,7 +1177,8 @@ async def spectrogram_loop():
 
 def apply_pipeline_params():
     runtime.vision.update_params(
-        yolo_threshold=settings_store.yolo_threshold,
+        yolo_threshold_low=settings_store.yolo_threshold_low,
+        yolo_threshold_high=settings_store.yolo_threshold_high,
         nms_threshold=settings_store.nms_threshold,
         draw_boxes=settings_store.draw_boxes,
     )
@@ -1048,8 +1267,8 @@ async def on_startup():
     handler.setLevel(logging.INFO)
     logger.addHandler(handler)
 
-    # if os.environ.get("HARDWARE_MODE") == "1":
-    if hardware_bridge.activate():
+    if os.environ.get("HARDWARE_MODE") == "1":
+        if hardware_bridge.activate():
             runtime.hardware_active = True
             runtime.hw_vision = hardware_bridge.HardwareVisionPipeline(VisionResult, VisionDetection)
             runtime.hw_audio = hardware_bridge.HardwareAudioPipeline(AudioResult)
@@ -1057,7 +1276,7 @@ async def on_startup():
             runtime.live_audio = runtime.hw_audio
             runtime.vision = runtime.hw_vision
             runtime.audio = runtime.hw_audio
-    else:
+        else:
             logger.warning("HARDWARE_MODE=1 requested but the hardware bridge failed to activate — staying simulated")
 
     if runtime.hardware_active:
@@ -1125,6 +1344,17 @@ async def ws_endpoint(websocket: WebSocket):
         "file": runtime.record_engine.filename,
     })
     await manager.send_to(websocket, {
+        "type": "frame_recording_state",
+        "recording": runtime.frame_record_engine.enabled,
+        "dir": runtime.frame_record_engine.dirname.name if runtime.frame_record_engine.dirname else None,
+        "count": runtime.frame_record_engine.frame_count,
+        "max_frames": runtime.frame_record_engine.max_frames,
+        "interval_s": runtime.frame_record_engine.interval_s,
+    })
+    await manager.send_to(websocket, acoustic_recording_payload())
+    pan_min, pan_max = hardware_bridge.get_camera_pan_range()
+    await manager.send_to(websocket, {"type": "camera_range", "min_deg": pan_min, "max_deg": pan_max})
+    await manager.send_to(websocket, {
         "type": "mode",
         "mode": runtime.mode,
         "file": runtime.current_recording_file,
@@ -1189,6 +1419,68 @@ async def ws_endpoint(websocket: WebSocket):
                     "recording": runtime.record_engine.enabled,
                     "file": runtime.record_engine.filename,
                 })
+
+            elif command == "set_frame_recording":
+                enabled = bool(msg.get("enabled", False))
+                fre = runtime.frame_record_engine
+                if enabled and not fre.enabled:
+                    try:
+                        interval_s = max(0.1, float(msg.get("interval_s", 1.0)))
+                        max_frames = max(1, int(msg.get("max_frames", 1200)))
+                    except (TypeError, ValueError):
+                        interval_s, max_frames = 1.0, 1200
+                    dirname = fre.start(interval_s=interval_s, max_frames=max_frames)
+                    logger.info("Frame recording started -> %s (every %.1fs, cap %d frames)", dirname, interval_s, max_frames)
+                elif not enabled and fre.enabled:
+                    logger.info("Frame recording stopped -> %s (%d frames saved)",
+                                 fre.dirname.name if fre.dirname else "?", fre.frame_count)
+                    fre.stop()
+                await manager.broadcast({
+                    "type": "frame_recording_state",
+                    "recording": fre.enabled,
+                    "dir": fre.dirname.name if fre.dirname else None,
+                    "count": fre.frame_count,
+                    "max_frames": fre.max_frames,
+                    "interval_s": fre.interval_s,
+                })
+
+            elif command == "set_acoustic_recording":
+                enabled = bool(msg.get("enabled", False))
+                are = runtime.acoustic_record_engine
+                if enabled and not are.enabled:
+                    try:
+                        window_s = max(1.0, min(5.0, float(msg.get("window_s", 2.0))))
+                        max_samples = max(1, int(msg.get("max_samples", 300)))
+                    except (TypeError, ValueError):
+                        window_s, max_samples = 2.0, 300
+                    dirname = are.start(window_s=window_s, max_samples=max_samples)
+                    logger.info("Acoustic sample recording armed -> %s (window=%.1fs, cap %d/class)", dirname, window_s, max_samples)
+                elif not enabled and are.enabled:
+                    logger.info("Acoustic sample recording disarmed -> %s (drone=%d, noise=%d)",
+                                 are.session_dir.name if are.session_dir else "?", are.drone_count, are.noise_count)
+                    are.stop()
+                await manager.broadcast(acoustic_recording_payload())
+
+            elif command == "set_acoustic_auto_save":
+                are = runtime.acoustic_record_engine
+                are.set_auto_save(bool(msg.get("enabled", True)))
+                logger.info("Acoustic auto-save on drone trigger: %s", "ON" if are.auto_save_drone else "OFF")
+                await manager.broadcast(acoustic_recording_payload())
+
+            elif command == "save_acoustic_sample":
+                label = msg.get("label")
+                are = runtime.acoustic_record_engine
+                if label not in ("drone", "noise"):
+                    logger.warning("save_acoustic_sample requires label 'drone' or 'noise'")
+                elif not runtime.hardware_active:
+                    logger.warning("save_acoustic_sample requires hardware mode - no real audio in simulated mode")
+                else:
+                    ok, info = are.save_sample(label)
+                    if ok:
+                        logger.info("Saved %s acoustic sample -> %s", label, info)
+                    else:
+                        logger.warning("Failed to save %s acoustic sample: %s", label, info)
+                    await manager.broadcast(acoustic_recording_payload())
 
             elif command == "inject_demo_detection":
                 ev = fabricate_fused_event(sim=True)

@@ -19,6 +19,7 @@
   @keyframes borderFlash { 0%,100%{ box-shadow: inset 0 0 0 7px rgba(239,68,68,.95); } 50%{ box-shadow: inset 0 0 0 7px rgba(239,68,68,0); } }
 
   .led-idle { background:#6b7280; }
+  .led-calibrating { background:#a855f7; animation: breathe 1.4s ease-in-out infinite; }
   .led-searching { background:#3b82f6; animation: breathe 2s ease-in-out infinite; }
   .led-slewing { background:#eab308; }
   .led-tracking { background:#f97316; animation: blink2hz .5s steps(1,end) infinite; }
@@ -49,11 +50,11 @@
   .header-bar > * { flex-shrink: 0; white-space: nowrap; }
   .main-row { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: row; overflow: hidden; }
   .tactical-col { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-  .video-box { flex: 4 1 0; min-height: 0; overflow: hidden; background: #000; display: flex; align-items: center; justify-content: center; }
-  .video-frame { position: relative; aspect-ratio: 4 / 3; max-width: 100%; max-height: 100%; width: 100%; background: #000; }
-  .radar-box { flex: 1 1 0; min-height: 100px; overflow: hidden; }
+  .video-box { flex: 1 1 auto; min-height: 0; overflow: hidden; background: #000; display: flex; align-items: center; justify-content: center; }
+  .video-frame { position: relative; aspect-ratio: 16 / 9; max-width: 100%; max-height: 100%; background: #000; }
+  .compass-strip { flex-shrink: 0; overflow: hidden; }
   .sidebar-col { width: 320px; flex-shrink: 0; min-height: 0; overflow-y: auto; }
-  .bottom-panel { flex-shrink: 0; height: 240px; overflow: hidden; display: flex; flex-direction: column; }
+  .bottom-panel { flex-shrink: 0; height: 190px; overflow: hidden; display: flex; flex-direction: column; }
   .tab-scroll-area { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
   .chart-mini { height: 90px; overflow: hidden; display: flex; flex-direction: column; }
   .chart-mini canvas { flex: 1 1 auto; min-height: 0; width: 100%; }
@@ -65,16 +66,23 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 const STATE_COLORS = {
-  IDLE: "led-idle", SEARCHING: "led-searching", SLEWING: "led-slewing",
+  IDLE: "led-idle", CALIBRATING: "led-calibrating", SEARCHING: "led-searching", SLEWING: "led-slewing",
   TRACKING: "led-tracking", ENGAGED: "led-engaged", DEGRADED: "led-degraded",
 };
 
-// liveHardware: true => actually wired to the real system (config.YOLO_CONF_THRESHOLD /
-// config.AUDIO_CLASSIFICATION_THRESHOLD via hardware_bridge.py). Everything else only
-// affects the simulated/replay pipelines - dimmed + labeled when running live on hardware.
+// Shared column widths for the Detection Events header row + every event row,
+// so they always line up (see the "genuinely fixed header" note further down).
+const EVENT_GRID_COLS = "1.2fr 0.85fr 0.65fr 0.85fr 0.85fr 0.85fr 0.75fr";
+
+// liveHardware: true => actually wired to the real system (config.YOLO_LOW_CONF_THRESHOLD /
+// config.YOLO_HIGH_CONF_THRESHOLD / config.AUDIO_CLASSIFICATION_THRESHOLD via
+// hardware_bridge.py). Everything else only affects the simulated/replay pipelines -
+// dimmed + labeled when running live on hardware.
 const SLIDER_DEFS = [
-  { key: "yolo_threshold", label: "YOLO Confidence Threshold", min: 0, max: 1, step: 0.01, liveHardware: true,
-    tip: "Minimum confidence score required for YOLOv8n to flag a visual bounding box as a drone." },
+  { key: "yolo_threshold_low", label: "YOLO Low Threshold", min: 0, max: 1, step: 0.01, liveHardware: true,
+    tip: "Candidate-detection floor: YOLO must clear this confidence just to be considered a possible drone at all (hysteresis lock-on lower bound)." },
+  { key: "yolo_threshold_high", label: "YOLO High Threshold", min: 0, max: 1, step: 0.01, liveHardware: true,
+    tip: "Confirmed-lock ceiling: once confidence clears this value the visual lock is confirmed and held even if it later dips back toward the low threshold (hysteresis)." },
   { key: "audio_threshold", label: "Acoustic CNN Threshold", min: 0, max: 1, step: 0.01, liveHardware: true,
     tip: "Probability cutoff for the Audio CNN classifier to trigger an acoustic detection alarm." },
   { key: "fusion_window_ms", label: "Sensor Fusion Window (ms)", min: 100, max: 2000, step: 10, liveHardware: false,
@@ -129,12 +137,25 @@ function App() {
   const [selectedRecording, setSelectedRecording] = useState("");
   const [activeTab, setActiveTab] = useState("System Logs");
   const [hardwareMode, setHardwareMode] = useState(false);
+  const [panMinDeg, setPanMinDeg] = useState(-90);
+  const [panMaxDeg, setPanMaxDeg] = useState(90);
+  const [frameRecording, setFrameRecording] = useState(false);
+  const [frameRecordCount, setFrameRecordCount] = useState(0);
+  const [frameRecordMax, setFrameRecordMax] = useState(1200);
+  const [frameRecordDir, setFrameRecordDir] = useState(null);
+  const [frameRecordIntervalInput, setFrameRecordIntervalInput] = useState("1.0");
+  const [frameRecordMaxInput, setFrameRecordMaxInput] = useState("1200");
+  const [acousticRecording, setAcousticRecording] = useState(false);
+  const [acousticAutoSaveDrone, setAcousticAutoSaveDrone] = useState(true);
+  const [acousticDroneCount, setAcousticDroneCount] = useState(0);
+  const [acousticNoiseCount, setAcousticNoiseCount] = useState(0);
+  const [acousticMaxSamples, setAcousticMaxSamples] = useState(300);
+  const [acousticWindowInput, setAcousticWindowInput] = useState("2.0");
+  const [acousticMaxInput, setAcousticMaxInput] = useState("300");
 
   const wsRef = useRef(null);
   const backoffRef = useRef(1000);
   const prevStateRef = useRef("IDLE");
-  const trailsRef = useRef([]); // {angle, kind, ts}
-  const radarCanvasRef = useRef(null);
   const spectroCanvasRef = useRef(null);
   const waveChartRef = useRef(null);
   const waveCanvasRef = useRef(null);
@@ -176,17 +197,20 @@ function App() {
           setTelemetry(msg);
           setSimActive(!!msg.sim);
           setHardwareMode(!!msg.hardware);
+          if (msg.frame_recording) {
+            setFrameRecording(!!msg.frame_recording.active);
+            setFrameRecordCount(msg.frame_recording.count || 0);
+            if (msg.frame_recording.max_frames) setFrameRecordMax(msg.frame_recording.max_frames);
+          }
+          if (msg.acoustic_recording) {
+            setAcousticRecording(!!msg.acoustic_recording.active);
+            setAcousticAutoSaveDrone(!!msg.acoustic_recording.auto_save_drone);
+            setAcousticDroneCount(msg.acoustic_recording.drone_count || 0);
+            setAcousticNoiseCount(msg.acoustic_recording.noise_count || 0);
+            if (msg.acoustic_recording.max_samples) setAcousticMaxSamples(msg.acoustic_recording.max_samples);
+          }
           if (msg.state === "ENGAGED" && prevStateRef.current !== "ENGAGED" && !alarmMuted) beep();
           prevStateRef.current = msg.state;
-          const now = Date.now() / 1000;
-          if (msg.vision && msg.vision.detections && msg.vision.detections.length) {
-            trailsRef.current.push({ angle: msg.vision.detections[0].azimuth_deg, kind: "visual", ts: now });
-          }
-          if (msg.acoustic && msg.acoustic.confidence >= (settingsRef.current?.audio_threshold ?? 0.7)) {
-            trailsRef.current.push({ angle: msg.acoustic.doa_deg, kind: "acoustic", ts: now });
-          }
-          trailsRef.current = trailsRef.current.filter(t => now - t.ts <= 3.0);
-          drawRadar(msg);
           updateWaveform(msg.waveform);
           break;
         }
@@ -204,10 +228,27 @@ function App() {
           setRecordingFile(msg.file || null);
           if (!msg.recording) refreshRecordings();
           break;
+        case "frame_recording_state":
+          setFrameRecording(!!msg.recording);
+          setFrameRecordDir(msg.dir || null);
+          setFrameRecordCount(msg.count || 0);
+          if (msg.max_frames) setFrameRecordMax(msg.max_frames);
+          break;
+        case "acoustic_recording_state":
+          setAcousticRecording(!!msg.recording);
+          setAcousticAutoSaveDrone(!!msg.auto_save_drone);
+          setAcousticDroneCount(msg.drone_count || 0);
+          setAcousticNoiseCount(msg.noise_count || 0);
+          if (msg.max_samples) setAcousticMaxSamples(msg.max_samples);
+          break;
         case "mode":
           setMode(msg.mode);
           setReplayFile(msg.file || null);
           if (msg.mode === "replay") setSelectedRecording(msg.file || "");
+          break;
+        case "camera_range":
+          if (typeof msg.min_deg === "number") setPanMinDeg(msg.min_deg);
+          if (typeof msg.max_deg === "number") setPanMaxDeg(msg.max_deg);
           break;
         default:
           break;
@@ -219,19 +260,6 @@ function App() {
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
   useEffect(() => { connect(); }, [connect]);
-
-  useEffect(() => {
-    function resizeRadar() {
-      const canvas = radarCanvasRef.current;
-      if (!canvas) return;
-      const w = canvas.clientWidth || 560;
-      canvas.width = w;
-      canvas.height = Math.round(w * 0.5);
-    }
-    resizeRadar();
-    window.addEventListener("resize", resizeRadar);
-    return () => window.removeEventListener("resize", resizeRadar);
-  }, [debugMode]);
 
   useEffect(() => {
     function onKey(e) {
@@ -267,6 +295,36 @@ function App() {
     sendCommand({ command: "set_recording", enabled: !recording });
   }
 
+  function toggleFrameRecording() {
+    if (!frameRecording) {
+      const interval_s = Math.max(0.1, parseFloat(frameRecordIntervalInput) || 1.0);
+      const max_frames = Math.max(1, parseInt(frameRecordMaxInput, 10) || 1200);
+      sendCommand({ command: "set_frame_recording", enabled: true, interval_s, max_frames });
+    } else {
+      sendCommand({ command: "set_frame_recording", enabled: false });
+    }
+  }
+
+  function toggleAcousticRecording() {
+    if (!acousticRecording) {
+      const window_s = Math.max(1.0, Math.min(5.0, parseFloat(acousticWindowInput) || 2.0));
+      const max_samples = Math.max(1, parseInt(acousticMaxInput, 10) || 300);
+      sendCommand({ command: "set_acoustic_recording", enabled: true, window_s, max_samples });
+    } else {
+      sendCommand({ command: "set_acoustic_recording", enabled: false });
+    }
+  }
+
+  function toggleAcousticAutoSave(e) {
+    const enabled = e.target.checked;
+    setAcousticAutoSaveDrone(enabled);
+    sendCommand({ command: "set_acoustic_auto_save", enabled });
+  }
+
+  function saveAcousticSample(label) {
+    sendCommand({ command: "save_acoustic_sample", label });
+  }
+
   function onSelectReplay(e) {
     const file = e.target.value;
     setSelectedRecording(file);
@@ -277,86 +335,12 @@ function App() {
     }
   }
 
-  // ---------- Radar (Component D) ----------
-  function drawRadar(msg) {
-    const canvas = radarCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    const W = canvas.width, H = canvas.height;
-    ctx.clearRect(0, 0, W, H);
-    const cx = W / 2, cy = H - 10;
-    const R = Math.min(W / 2 - 10, H - 30);
-
-    ctx.strokeStyle = "#2a2f38";
-    ctx.lineWidth = 1;
-    for (const frac of [0.33, 0.66, 1.0]) {
-      ctx.beginPath();
-      ctx.arc(cx, cy, R * frac, Math.PI, 2 * Math.PI);
-      ctx.stroke();
-    }
-    // angle ticks
-    ctx.fillStyle = "#8b93a1";
-    ctx.font = "11px monospace";
-    for (const deg of [-90, -45, 0, 45, 90]) {
-      const rad = (deg - 90) * Math.PI / 180;
-      const x = cx + R * Math.cos(rad), y = cy + R * Math.sin(rad);
-      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y);
-      ctx.strokeStyle = "#20242c"; ctx.stroke();
-      ctx.fillText(`${deg}°`, x - 12, y - 4 * Math.sign(deg || 1) + (deg === 0 ? -6 : 0));
-    }
-    // camera FOV boundary (+/-45 deg = 90 total)
-    ctx.strokeStyle = "#3b82f6";
-    ctx.setLineDash([5, 4]);
-    for (const deg of [-45, 45]) {
-      const rad = (deg - 90) * Math.PI / 180;
-      ctx.beginPath(); ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + R * Math.cos(rad), cy + R * Math.sin(rad));
-      ctx.stroke();
-    }
-    ctx.setLineDash([]);
-
-    const toRad = deg => (deg - 90) * Math.PI / 180;
-    const state = msg.state;
-    const fused = state === "ENGAGED";
-
-    // acoustic DOA sector (30 deg wide = +/-15)
-    if (msg.acoustic && telemetryHasAudio(msg)) {
-      const doa = msg.acoustic.doa_deg;
-      const a0 = toRad(doa - 15), a1 = toRad(doa + 15);
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.arc(cx, cy, R * 0.9, a0, a1);
-      ctx.closePath();
-      ctx.fillStyle = fused ? "rgba(239,68,68,0.35)" : "rgba(56,189,248,0.28)";
-      ctx.fill();
-    }
-    // visual detection marker
-    if (msg.vision && msg.vision.detections && msg.vision.detections.length) {
-      const az = msg.vision.detections[0].azimuth_deg;
-      const rad = toRad(az);
-      const x = cx + R * 0.65 * Math.cos(rad), y = cy + R * 0.65 * Math.sin(rad);
-      ctx.beginPath();
-      ctx.arc(x, y, fused ? 8 : 5, 0, 2 * Math.PI);
-      ctx.fillStyle = fused ? "#ef4444" : "#22c55e";
-      if (fused) { ctx.shadowColor = "#ef4444"; ctx.shadowBlur = 18; }
-      ctx.fill();
-      ctx.shadowBlur = 0;
-    }
-    // trails, 3s alpha fade
-    const now = Date.now() / 1000;
-    for (const t of trailsRef.current) {
-      const age = now - t.ts;
-      const alpha = Math.max(0, 1 - age / 3.0) * 0.5;
-      const rad = toRad(t.angle);
-      const rr = t.kind === "visual" ? R * 0.65 : R * 0.9;
-      const x = cx + rr * Math.cos(rad), y = cy + rr * Math.sin(rad);
-      ctx.beginPath();
-      ctx.arc(x, y, 3, 0, 2 * Math.PI);
-      ctx.fillStyle = t.kind === "visual" ? `rgba(34,197,94,${alpha})` : `rgba(56,189,248,${alpha})`;
-      ctx.fill();
-    }
-  }
-  function telemetryHasAudio(msg) { return msg.audio && msg.audio.active; }
+  // Component D replaced the old polar radar (which showed nothing meaningful
+  // once real per-target azimuth wasn't wired through hardware) with a compact
+  // compass strip: camera bearing (real PTZ pan in hardware mode, a fabricated
+  // value that eases toward the acoustic DOA in simulated mode) plotted against
+  // the acoustic DOA sector, so convergence is visible directly. See
+  // <CompassStrip> below.
 
   // ---------- Spectrogram (Canvas ImageData, never Chart.js) ----------
   function drawSpectrogram(msg) {
@@ -400,9 +384,9 @@ function App() {
   }
 
   function exportCSV() {
-    const header = "timestamp,modality,class,confidence,azimuth_deg\n";
+    const header = "timestamp,modality,class,acoustic_confidence,visual_confidence,combined_confidence,azimuth_deg\n";
     const rows = events.map(e =>
-      `${new Date(e.ts * 1000).toISOString()},${e.modality},${e.cls},${e.confidence},${e.azimuth_deg}`
+      `${new Date(e.ts * 1000).toISOString()},${e.modality},${e.cls},${e.acoustic_confidence ?? ""},${e.visual_confidence ?? ""},${e.combined_confidence ?? ""},${e.azimuth_deg}`
     ).join("\n");
     const blob = new Blob([header + rows], { type: "text/csv" });
     const a = document.createElement("a");
@@ -488,6 +472,30 @@ function App() {
             {recording ? "Recording…" : "Record Session"}
           </button>
 
+          <div className="w-px self-stretch bg-gray-700 mx-1"></div>
+
+          <div className="flex items-center gap-1" title="Save sampled JPEG frames from the video feed to gui_dashboard/recordings/ for later model training">
+            <button disabled={!connected} onClick={toggleFrameRecording}
+              className={`px-3 py-1.5 rounded text-sm font-semibold flex items-center gap-1.5 disabled:opacity-40 ${frameRecording ? "bg-red-700" : "bg-gray-700"}`}>
+              <span className={`w-2 h-2 rounded-full inline-block ${frameRecording ? "bg-red-300 animate-pulse" : "bg-gray-400"}`}></span>
+              {frameRecording ? `Frames ${frameRecordCount}/${frameRecordMax}` : "Record Frames"}
+            </button>
+            {!frameRecording && (
+              <React.Fragment>
+                <input type="number" min="0.1" step="0.1" value={frameRecordIntervalInput}
+                  onChange={e => setFrameRecordIntervalInput(e.target.value)}
+                  title="Seconds between saved frames (lower = more frames = more disk use)" disabled={!connected}
+                  className="w-14 bg-gray-800 border border-gray-600 rounded text-xs px-1 py-1.5 disabled:opacity-40" />
+                <span className="text-xs text-gray-500">s /</span>
+                <input type="number" min="1" step="10" value={frameRecordMaxInput}
+                  onChange={e => setFrameRecordMaxInput(e.target.value)}
+                  title="Auto-stop after this many frames (safety cap)" disabled={!connected}
+                  className="w-16 bg-gray-800 border border-gray-600 rounded text-xs px-1 py-1.5 disabled:opacity-40" />
+                <span className="text-xs text-gray-500">max</span>
+              </React.Fragment>
+            )}
+          </div>
+
           <select disabled={!connected} value={selectedRecording} onChange={onSelectReplay}
             title="Replay a recorded session — the GUI behaves identically to live"
             className="bg-gray-800 border border-gray-600 rounded text-sm px-2 py-1.5 disabled:opacity-40">
@@ -508,9 +516,10 @@ function App() {
           panel (guaranteed via .main-row). Tactical-Col (left) + Diagnostics-Col (right). */}
       <div className="main-row">
 
-        {/* Tactical-Col: video+radar stacked via flex-grow ratios (3:1, guaranteed via
-            .tactical-col/.video-box/.radar-box) so neither can ever balloon past what
-            the column actually has - no aspect-ratio, no reliance on content size. */}
+        {/* Tactical-Col: video (flex-grow, fills all remaining height) + a fixed-height
+            compass strip stacked via .tactical-col/.video-box/.compass-strip - the video
+            can never be squeezed by the compass since the compass no longer competes
+            for flex-grow share (it has a fixed height instead). */}
         <div className={"tactical-col w-2/3 " + (debugMode ? "gap-3 p-3" : "gap-0 p-0")}>
           {debugMode && (
             <div className="shrink-0 flex justify-between items-center">
@@ -523,10 +532,13 @@ function App() {
             </div>
           )}
 
-          {/* Video: always mounted <img>, sized by flex-grow (not aspect-ratio) on the
-              outer box so it never dictates its own height from stream content - no
-              reflow, no flicker. The inner .video-frame hugs the real 4:3 (640x480)
-              content instead of stretching across the whole (much wider) flex slot. */}
+          {/* Video: outer .video-box is sized by flex-grow so it never dictates the
+              tactical column's height from stream content - no reflow, no flicker.
+              The inner .video-frame has no explicit width/height, only aspect-ratio
+              + max-width/max-height - that lets the browser derive BOTH dimensions
+              jointly (the true "shrink to fit, keep the 16:9 = 1280x720 ratio"
+              behavior) instead of computing height from a fixed width and then just
+              clipping it, which silently distorted the box below its max-height. */}
           <div className={"video-box w-full " + (debugMode ? "rounded-lg" : "")}>
             <div className="video-frame">
               <img src="/video_feed" className="absolute inset-0 w-full h-full object-contain bg-black" />
@@ -547,14 +559,13 @@ function App() {
             </div>
           )}
 
-          {/* Radar: guaranteed via .radar-box (flex:1, min-height:100px - can never collapse).
-              Hidden (not unmounted, keeps the canvas ref/draw loop harmless) in hardware
-              mode - the bridge doesn't surface real per-target azimuth yet, so it would
-              only ever show an empty plot there. display:none removes it from the flex
-              distribution entirely, so the video box automatically fills 100% of the
-              tactical column's height. Still fully live in simulated/replay mode. */}
-          <div className={"radar-box w-full bg-panel p-2 " + (hardwareMode ? "hidden " : "") + (debugMode ? "rounded-lg" : "")}>
-            <canvas ref={radarCanvasRef} className="w-full h-full block"></canvas>
+          {/* Compass strip: camera bearing vs acoustic DOA, replacing the old polar
+              radar. Fixed height (not flex-grow), so it never competes with the video
+              for space - always live in both hardware and simulated mode (simulated
+              values are explicitly fabricated for demo purposes, see telemetry_loop
+              in main.py). */}
+          <div className={"compass-strip w-full bg-panel p-2 " + (debugMode ? "rounded-lg" : "")}>
+            <CompassStrip telemetry={telemetry} panMinDeg={panMinDeg} panMaxDeg={panMaxDeg} />
           </div>
         </div>
 
@@ -573,6 +584,63 @@ function App() {
             {SLIDER_DEFS.filter(def => def.liveHardware).map(def => (
               <SliderControl key={def.key} def={def} settings={settings} pending={pending} connected={connected} updateSetting={updateSetting} />
             ))}
+          </div>
+
+          {/* Acoustic Sample Recorder - hardware mode only (no real audio in
+              simulated mode). drone/ fills automatically off real trigger events
+              (toggle-able below for noisy environments prone to false positives);
+              noise/ fills manually so the user picks their own representative
+              quiet moments. Live counts let class balance be kept by eye. */}
+          <div className="text-xs font-semibold text-green-400 uppercase tracking-wide mb-2 flex items-center gap-2">
+            Acoustic Sample Recorder
+            {!hardwareMode && <span className="normal-case bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded text-[10px] font-normal">Hardware Mode Only</span>}
+          </div>
+          <div className={"flex flex-col gap-2 mb-4 p-2 rounded border border-gray-700 " + (!hardwareMode ? "opacity-40" : "")}>
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-gray-400">
+                Drone: <span className="text-gray-200 tabular-nums">{acousticDroneCount}</span>
+                {" / Noise: "}<span className="text-gray-200 tabular-nums">{acousticNoiseCount}</span>
+              </span>
+              <span className="text-gray-500 tabular-nums">cap {acousticMaxSamples}/class</span>
+            </div>
+
+            <label className="flex items-center gap-2 text-xs text-gray-300"
+              title="When on, a sample is saved to drone/ automatically on every fresh acoustic trigger. Turn off in noisy environments prone to false positives.">
+              <input type="checkbox" disabled={!connected || !hardwareMode} checked={acousticAutoSaveDrone} onChange={toggleAcousticAutoSave} />
+              Auto-save on drone trigger
+            </label>
+
+            {!acousticRecording && (
+              <div className="flex items-center gap-1 text-xs">
+                <input type="number" min="1" max="5" step="0.5" value={acousticWindowInput}
+                  onChange={e => setAcousticWindowInput(e.target.value)}
+                  title="Clip length in seconds (1-5)" disabled={!connected || !hardwareMode}
+                  className="w-14 bg-gray-800 border border-gray-600 rounded px-1 py-1 disabled:opacity-40" />
+                <span className="text-gray-500">s /</span>
+                <input type="number" min="1" step="10" value={acousticMaxInput}
+                  onChange={e => setAcousticMaxInput(e.target.value)}
+                  title="Max samples per class before auto-stop" disabled={!connected || !hardwareMode}
+                  className="w-16 bg-gray-800 border border-gray-600 rounded px-1 py-1 disabled:opacity-40" />
+                <span className="text-gray-500">max/class</span>
+              </div>
+            )}
+
+            <button disabled={!connected || !hardwareMode} onClick={toggleAcousticRecording}
+              className={`px-2 py-1.5 rounded text-xs font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40 ${acousticRecording ? "bg-red-700" : "bg-gray-700"}`}>
+              <span className={`w-2 h-2 rounded-full inline-block ${acousticRecording ? "bg-red-300 animate-pulse" : "bg-gray-400"}`}></span>
+              {acousticRecording ? "Recording Armed" : "Arm Recording"}
+            </button>
+
+            <div className="flex gap-2">
+              <button disabled={!connected || !hardwareMode || !acousticRecording} onClick={() => saveAcousticSample("drone")}
+                className="flex-1 px-2 py-1.5 rounded text-xs font-semibold bg-sky-700 disabled:opacity-40">
+                Save Drone Sample
+              </button>
+              <button disabled={!connected || !hardwareMode || !acousticRecording} onClick={() => saveAcousticSample("noise")}
+                className="flex-1 px-2 py-1.5 rounded text-xs font-semibold bg-gray-600 disabled:opacity-40">
+                Save Noise Sample
+              </button>
+            </div>
           </div>
 
           <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-2">
@@ -643,28 +711,76 @@ function App() {
               Header and rows share the same gridTemplateColumns so columns line up. */}
           <div className={(activeTab === "Detection Events" ? "flex" : "hidden") + " flex-col h-full"}>
             <div className="grid text-gray-400 text-xs font-semibold border-b border-gray-800 shrink-0"
-              style={{ gridTemplateColumns: "1.4fr 1fr 0.8fr 1fr 0.8fr" }}>
+              style={{ gridTemplateColumns: EVENT_GRID_COLS }}>
               <div className="p-1">Timestamp</div>
               <div className="p-1">Modality</div>
               <div className="p-1">Class</div>
-              <div className="p-1">Confidence</div>
+              <div className="p-1" title="Acoustic CNN confidence at the moment of this event">Acoustic</div>
+              <div className="p-1" title="Visual (YOLO) confidence at the moment of this event, if the optical track had one">Visual</div>
+              <div className="p-1" title="Simple 50/50 average of Acoustic + Visual, when both are known for this target">Combined</div>
               <div className="p-1">Azimuth</div>
             </div>
             <div className="flex-1 overflow-y-auto">
               {events.map((e, i) => (
                 <div key={i}
                   className={"grid text-xs " + (e.modality === "Fused" ? "bg-red-950/50" : "")}
-                  style={{ gridTemplateColumns: "1.4fr 1fr 0.8fr 1fr 0.8fr" }}>
+                  style={{ gridTemplateColumns: EVENT_GRID_COLS }}>
                   <div className="p-1 tabular-nums">{new Date(e.ts * 1000).toLocaleTimeString()}</div>
                   <div className="p-1">{e.modality}{e.sim ? " (SIM)" : ""}</div>
                   <div className="p-1">{e.cls}</div>
-                  <div className="p-1 tabular-nums">{fmt(e.confidence,2)}</div>
+                  <div className="p-1 tabular-nums">{fmt(e.acoustic_confidence,2)}</div>
+                  <div className="p-1 tabular-nums">{fmt(e.visual_confidence,2)}</div>
+                  <div className="p-1 tabular-nums">{fmt(e.combined_confidence,2)}</div>
                   <div className="p-1 tabular-nums">{fmt(e.azimuth_deg,1)}°</div>
                 </div>
               ))}
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function CompassStrip({ telemetry, panMinDeg, panMaxDeg }) {
+  const state = telemetry?.state || "IDLE";
+  const doa = telemetry?.acoustic?.doa_deg ?? 0;
+  const cameraPan = telemetry?.camera_pan_deg ?? 0;
+  const diff = Math.abs(cameraPan - doa);
+  const aligned = diff <= 15;
+  const engaged = state === "ENGAGED";
+
+  // Range comes from the live config (Jetson_files/config.py MIN_ANGLE/MAX_ANGLE,
+  // sent once at connect via the "camera_range" message) rather than a hardcoded
+  // +/-90 - the real PTZ can swing much wider than the optical FOV.
+  const lo = (typeof panMinDeg === "number") ? panMinDeg : -90;
+  const hi = (typeof panMaxDeg === "number") ? panMaxDeg : 90;
+  const span = Math.max(1, hi - lo);
+  const toPct = deg => Math.max(0, Math.min(100, ((deg - lo) / span) * 100));
+  const doaLeftPct = toPct(doa - 15);
+  const doaWidthPct = Math.max(0, toPct(doa + 15) - doaLeftPct);
+  const ticks = [lo, lo + span * 0.25, lo + span * 0.5, lo + span * 0.75, hi];
+
+  return (
+    <div>
+      <div className="text-xs text-gray-400 mb-1 flex justify-between">
+        <span>Camera Bearing vs Acoustic DOA</span>
+        <span className="tabular-nums">{aligned ? "ALIGNED" : `${fmt(diff, 0)}° off`}</span>
+      </div>
+      <div className="relative h-10 bg-black rounded overflow-hidden">
+        {/* Camera optical FOV (+/-45deg), for context - independent of the wider mechanical pan range */}
+        {(-45 >= lo && -45 <= hi) && <div className="absolute inset-y-0 border-l border-dashed border-blue-500/40" style={{ left: `${toPct(-45)}%` }}></div>}
+        {(45 >= lo && 45 <= hi) && <div className="absolute inset-y-0 border-l border-dashed border-blue-500/40" style={{ left: `${toPct(45)}%` }}></div>}
+        {(0 >= lo && 0 <= hi) && <div className="absolute inset-y-0 border-l border-gray-700" style={{ left: `${toPct(0)}%` }}></div>}
+        {/* Acoustic DOA sector (+/-15deg, same array resolution as before) */}
+        <div className={"absolute inset-y-0 " + (engaged ? "bg-red-500/40" : "bg-sky-500/30")}
+          style={{ left: `${doaLeftPct}%`, width: `${doaWidthPct}%` }}></div>
+        {/* Camera pan marker - green when aligned with the DOA sector, red while ENGAGED */}
+        <div className={"absolute inset-y-0 w-1 " + (engaged ? "bg-red-400" : aligned ? "bg-green-400" : "bg-orange-400")}
+          style={{ left: `${toPct(cameraPan)}%` }}></div>
+      </div>
+      <div className="flex justify-between text-[10px] text-gray-600 mt-0.5">
+        {ticks.map((t, i) => <span key={i} className="tabular-nums">{Math.round(t)}°</span>)}
       </div>
     </div>
   );

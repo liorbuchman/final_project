@@ -4,6 +4,8 @@ import config
 import logging
 import time     
 import math
+import queue
+import threading
 from ultralytics import YOLO
 from uav_vision.camera_AC import setup_camera, move_camera, set_light_raw, stop_camera
 
@@ -19,70 +21,63 @@ class OpticalDetector:
         # Tracking telemetry offsets
         self.error_x = 0.0
         self.error_y = 0.0
+        #error history for derivative term
+        self.prev_error_x = 0.0
+        self.prev_error_y = 0.0
+    
+        self.ptz_queue = queue.Queue(maxsize=1) 
+        self.ptz_worker_running = True
+        self.ptz_thread = threading.Thread(target=self._ptz_worker_loop, daemon=True, name="PTZ_Worker")
+        self.ptz_thread.start()
         
-        # Phase 1: Acoustic Tracking State
         self.current_camera_pan = 0.0
         self.current_tilt = config.DEFAULT_ELEVATION_ANGLE
 
     def auto_calibrate_and_home(self):
         """
-        Executes physical homing & dynamic calibration sequence at system boot.
+        Executes physical homing sequence using deterministic open-loop control.
+        Assumes PAN_TIME_END_TO_END and TILT_TIME_END_TO_END in config.py 
+        are perfectly measured via a manual stopwatch test.
         """
         if self.ptz is None:
             logging.error("[Calibration] PTZ connection missing!")
             return False
 
-        logging.info("[Calibration] STARTING DYNAMIC HOMING & CALIBRATION...")
-        pan_range = config.MAX_ANGLE - config.MIN_ANGLE
-        # --- PAN CALIBRATION ---
-        # 1. Drive to Right limit
-        self.track_target(-config.MOVE_SPEED, 0.0)
-        time.sleep(26.0)
-        stop_camera(self.ptz, self.move_req)
-
-        # 2. Measure travel time to Left limit
-        t_start = time.time()
-        self.track_target(config.MOVE_SPEED, 0.0)
-        time.sleep(26.0)
-        stop_camera(self.ptz, self.move_req)
+        logging.info("[Calibration] STARTING DETERMINISTIC HOMING...")
         
-        measured_pan_time = time.time() - t_start
-        config.PAN_TIME_END_TO_END = measured_pan_time
-        config.TIME_PER_DEGREE = measured_pan_time / pan_range
-        logging.info(f"[Calibration] Calculated TIME_PER_DEGREE: {config.TIME_PER_DEGREE:.5f}s")
-
-        # 3. Home Pan to Center (0.0°)
-        time_to_center = (pan_range / 2.0) * config.TIME_PER_DEGREE
+        # --- PAN CALIBRATION ---
+        # 1. Drive to absolute Right limit
+        logging.info("[Calibration] Finding Pan Right Limit...")
         self.track_target(-config.MOVE_SPEED, 0.0)
-        time.sleep(time_to_center)
-        stop_camera(self.ptz, self.move_req)
+        time.sleep(config.PAN_TIME_END_TO_END + 2.0)
+        
+        # 2. Drive to Center
+        logging.info("[Calibration] Moving Pan to absolute Center...")
+        self.track_target(config.MOVE_SPEED, 0.0)
+        time.sleep(config.PAN_TIME_END_TO_END / 2.0)
+        
+        self.track_target(0.0, 0.0) 
         self.current_camera_pan = 0.0
+        time.sleep(0.5) 
 
         # --- TILT CALIBRATION ---
-        # 1. Drive to Bottom limit
+        # 1. Drive to absolute Bottom limit
+        logging.info("[Calibration] Finding Tilt Bottom Limit...")
         self.track_target(0.0, -config.MOVE_SPEED)
-        time.sleep(10.0)
-        stop_camera(self.ptz, self.move_req)
-
-        # 2. Measure travel time to Top limit
-        t_start_tilt = time.time()
-        self.track_target(0.0, config.MOVE_SPEED)
-        time.sleep(config.TILT_TIME_END_TO_END)
-        stop_camera(self.ptz, self.move_req)
+        time.sleep(config.TILT_TIME_END_TO_END + 2.0)
         
-        measured_tilt_time = time.time() - t_start_tilt
-        config.TILT_TIME_END_TO_END = measured_tilt_time
-        config.TIME_PER_DEGREE_TILT = measured_tilt_time / config.TILT_RANGE_SOFTWARE
-        logging.info(f"[Calibration] Calculated TIME_PER_DEGREE_TILT: {config.TIME_PER_DEGREE_TILT:.5f}s")
-
-        # 3. Home Tilt to Default Elevation 
-        self.track_target(0.0, -config.MOVE_SPEED)
-        degrees_down = abs(config.MAX_TILT - config.DEFAULT_ELEVATION_ANGLE)
-        time.sleep(degrees_down * config.TIME_PER_DEGREE_TILT)
-        stop_camera(self.ptz, self.move_req)
+        # 2. Drive up to Default Elevation
+        logging.info(f"[Calibration] Moving Tilt to {config.DEFAULT_ELEVATION_ANGLE}°...")
+        degrees_up = config.DEFAULT_ELEVATION_ANGLE - config.MIN_TILT
+        time_up = degrees_up * config.TIME_PER_DEGREE_TILT
+        
+        self.track_target(0.0, config.MOVE_SPEED)
+        time.sleep(time_up)
+        
+        self.track_target(0.0, 0.0) 
         self.current_tilt = config.DEFAULT_ELEVATION_ANGLE
 
-        logging.info("[Calibration] HOMING COMPLETE! Camera centered at (0°, 60°).")
+        logging.info("[Calibration] HOMING COMPLETE! Camera centered.")
         return True
     
     def initialize_hardware(self):
@@ -96,9 +91,17 @@ class OpticalDetector:
 
     def run_inference(self, frame):
         """Processes 640x480 frame matrices on GPU and extracts spatial target center errors."""
-        #logging.info(f"[DEBUG] Frame shape before YOLO: {frame.shape}")
-        cv2.imwrite("what_yolo_actually_sees.jpg", frame)
-        results = self.model.track(frame, stream=False, persist=True, tracker="bytetrack.yaml", half=True, conf=config.YOLO_LOW_CONF_THRESHOLD, verbose=False)
+        if config.SAVE_LAST_FRAME_FLAG:
+            #logging.info(f"[DEBUG] Frame shape before YOLO: {frame.shape}")
+            cv2.imwrite("what_yolo_actually_sees.jpg", frame)
+        use_half = (config.DEVICE.type == 'cuda')
+        results = self.model.track(frame, 
+                                   stream=False, 
+                                   persist=True, 
+                                   tracker="bytetrack.yaml", 
+                                   half=use_half, 
+                                   conf=config.YOLO_LOW_CONF_THRESHOLD, 
+                                   verbose=False)
         detected_this_frame = False
         
         for r in results:
@@ -145,67 +148,85 @@ class OpticalDetector:
                 self.high_conf_achieved = False
         
         return frame
+    def _ptz_worker_loop(self):
+        """
+        Dedicated background thread to handle PTZ motor commands asynchronously.
+        This prevents blocking the main thread during HTTP/SOAP requests to the camera.
+        """
+        while self.ptz_worker_running:
+            try:
+                pan_speed, tilt_speed = self.ptz_queue.get(timeout=0.1)
+                move_camera(self.ptz, self.move_req, pan_speed, tilt_speed)
+            except queue.Empty:
+                pass
+            except Exception as e:
+                logging.error(f"[PTZ Worker] Error moving camera: {e}")
 
-    def track_target(self, pan_speed, tilt_speed):
-        move_camera(self.ptz, self.move_req, pan_speed, tilt_speed)
-        
+    def track_target(self, pan_speed, tilt_speed, wait=False):
+        #move_camera(self.ptz, self.move_req, pan_speed, tilt_speed) # old version
+        if self.ptz_queue.full():
+            try:
+                self.ptz_queue.get_nowait()
+            except queue.Empty:
+                pass
+        self.ptz_queue.put((pan_speed, tilt_speed))
+
+        if wait:
+            time.sleep(0.15)
+
     def execute_visual_closed_loop(self):
-        """
-        Phase 2: Visual Tracking - Zoned Control with Deadband for ONVIF Optimization.
-        This approach drastically reduces network spam by sending discrete speed commands
-        only when the target crosses specific bounding zones.
-        """
+        """Phase 2: Visual Tracking - PD Controller with Time Delta (dt)"""
         if self.ptz is None: 
             return
 
         if not self.visual_lock:
-            self.track_target(0.0, 0.0)  # Stop motors if no visual lock
+            self.track_target(0.0, 0.0)
+            self.prev_error_x = 0.0 
+            self.prev_error_y = 0.0
+            self.prev_time = time.time() 
             return
         
-        # 1. Define the Deadzone - The target is centered enough, do not move the motors.
-        # This prevents micro-jitters when the drone is hovering in the center.
-        deadzone_x = config.FRAME_WIDTH * 0.15  # ~96 pixels from the center horizontally
-        deadzone_y = config.FRAME_HEIGHT * 0.15 # ~72 pixels from the center vertically
         
-        # 2. Define tered motor speeds (Gears)
-        fast_speed = 0.8 # Maximum speed for when the target is escaping the frame edge
-        smooth_speed = 0.4 # Slower, smooth speed for normal tracking (can be tuned)
+        current_time = time.time()
+        dt = current_time - getattr(self, 'prev_time', current_time - 0.1)
+        if dt <= 0: dt = 0.001 
+        self.prev_time = current_time
+
+        deadzone_x = config.FRAME_WIDTH * 0.10
+        deadzone_y = config.FRAME_HEIGHT * 0.10
         
         pan_speed = 0.0
         tilt_speed = 0.0
         
-        # --- X-Axis (Pan) Logic ---
+        # --- X-Axis (Pan) Logic - PD ---
         abs_error_x = abs(self.error_x)
         if abs_error_x > deadzone_x:
-            # If the target is near the extreme edges of the screen -> go fast. Otherwise -> smooth.
-            if abs_error_x > (config.FRAME_WIDTH * 0.35):
-                base_pan = fast_speed
-            else:
-                base_pan = smooth_speed
+           
+            delta_x = (self.error_x - self.prev_error_x) / dt 
             
-            # Apply direction based on your specific camera hardware calibration.
-            # If error_x > 0, the target is on the right side of the screen.
-            # Note: Right movement is negative (-) based on previous physical tests.
-            pan_speed = -base_pan if self.error_x > 0 else base_pan
+            p_term_x = self.error_x * config.KP_PAN
+            d_term_x = delta_x * config.KD_PAN
+            
+            raw_pan = -1.0 * (p_term_x + d_term_x)
+            pan_speed = max(-1.0, min(1.0, raw_pan))
 
-        # --- Y-Axis (Tilt) Logic ---
+        # --- Y-Axis (Tilt) Logic - PD ---
         abs_error_y = abs(self.error_y)
         if abs_error_y > deadzone_y:
-            if abs_error_y > (config.FRAME_HEIGHT * 0.35):
-                base_tilt = fast_speed
-            else:
-                base_tilt = smooth_speed
+            delta_y = (self.error_y - self.prev_error_y) / dt 
             
-            # If error_y > 0, the target is in the lower part of the screen, so we move down.
-            # TILT_DIRECTION_INVERSION from config handles upside-down ceiling installations.
-            raw_tilt_speed = base_tilt if self.error_y > 0 else -base_tilt
-            tilt_speed = raw_tilt_speed * config.TILT_DIRECTION_INVERSION
+            p_term_y = self.error_y * config.KP_TILT
+            d_term_y = delta_y * config.KD_TILT
+            
+            raw_tilt = (p_term_y + d_term_y) * config.TILT_DIRECTION_INVERSION
+            tilt_speed = max(-1.0, min(1.0, raw_tilt))
 
-        # 3. Dispatch the command!
-        # Thanks to the state-caching mechanism in camera_AC.py, an actual HTTP/SOAP request 
-        # is ONLY sent over the network if the calculated speeds have physically changed.
+        self.prev_error_x = self.error_x
+        self.prev_error_y = self.error_y
+
         self.track_target(pan_speed, tilt_speed)
 
+   
     def calculate_pan_movement(self, target_doa):
         """Calculates direction and degrees needed to reach the acoustic DOA."""
         target_angle = target_doa
@@ -263,13 +284,13 @@ class OpticalDetector:
             
             # Start pan motor
             self.track_target(x_speed, 0.0)
-            sleep_time = degrees_to_move * config.TIME_PER_DEGREE
+            sleep_time = degrees_to_move * config.TIME_PER_DEGREE_PAN
             
             # Wait for movement to finish, BUT abort if YOLO sees the drone
             target_found_during_pan = self._sleep_and_check_lock(sleep_time)
             
             # Stop motor and update software position state
-            stop_camera(self.ptz, self.move_req)
+            self.track_target(0.0, 0.0)
             self.current_camera_pan = safe_target
             
             if target_found_during_pan:
@@ -306,7 +327,7 @@ class OpticalDetector:
                 
                 # Sleep mostly blind, but keep a tiny chance to catch it mid-flight
                 target_found_during_move = self._sleep_and_check_lock(time_to_tilt)
-                stop_camera(self.ptz, self.move_req)
+                self.track_target(0.0, 0.0)
                 self.current_tilt = target_tilt
                 
                 if target_found_during_move:
@@ -323,7 +344,63 @@ class OpticalDetector:
                 logging.info(f"*** TARGET VISUALLY ACQUIRED at ~{target_tilt}°! ***")
                 break
 
-
+        # old version of tracking the drone after YOLO detection 
+        # def execute_visual_closed_loop(self): 
+        #     """
+        #     Phase 2: Visual Tracking - Zoned Control with Deadband for ONVIF Optimization.
+        #     This approach drastically reduces network spam by sending discrete speed commands
+        #     only when the target crosses specific bounding zones.
+        #     """
+        #     if self.ptz is None: 
+        #         return
+    
+        #     if not self.visual_lock:
+        #         self.track_target(0.0, 0.0)  # Stop motors if no visual lock
+        #         return
+            
+        #     # 1. Define the Deadzone - The target is centered enough, do not move the motors.
+        #     # This prevents micro-jitters when the drone is hovering in the center.
+        #     deadzone_x = config.FRAME_WIDTH * 0.15  # ~96 pixels from the center horizontally
+        #     deadzone_y = config.FRAME_HEIGHT * 0.15 # ~72 pixels from the center vertically
+            
+        #     # 2. Define tered motor speeds (Gears)
+        #     fast_speed = 0.8 # Maximum speed for when the target is escaping the frame edge
+        #     smooth_speed = 0.4 # Slower, smooth speed for normal tracking (can be tuned)
+            
+        #     pan_speed = 0.0
+        #     tilt_speed = 0.0
+            
+        #     # --- X-Axis (Pan) Logic ---
+        #     abs_error_x = abs(self.error_x)
+        #     if abs_error_x > deadzone_x:
+        #         # If the target is near the extreme edges of the screen -> go fast. Otherwise -> smooth.
+        #         if abs_error_x > (config.FRAME_WIDTH * 0.35):
+        #             base_pan = fast_speed
+        #         else:
+        #             base_pan = smooth_speed
+                
+        #         # Apply direction based on your specific camera hardware calibration.
+        #         # If error_x > 0, the target is on the right side of the screen.
+        #         # Note: Right movement is negative (-) based on previous physical tests.
+        #         pan_speed = -base_pan if self.error_x > 0 else base_pan
+    
+        #     # --- Y-Axis (Tilt) Logic ---
+        #     abs_error_y = abs(self.error_y)
+        #     if abs_error_y > deadzone_y:
+        #         if abs_error_y > (config.FRAME_HEIGHT * 0.35):
+        #             base_tilt = fast_speed
+        #         else:
+        #             base_tilt = smooth_speed
+                
+        #         # If error_y > 0, the target is in the lower part of the screen, so we move down.
+        #         # TILT_DIRECTION_INVERSION from config handles upside-down ceiling installations.
+        #         raw_tilt_speed = base_tilt if self.error_y > 0 else -base_tilt
+        #         tilt_speed = raw_tilt_speed * config.TILT_DIRECTION_INVERSION
+    
+        #     # 3. Dispatch the command!
+        #     # Thanks to the state-caching mechanism in camera_AC.py, an actual HTTP/SOAP request 
+        #     # is ONLY sent over the network if the calculated speeds have physically changed.
+        #     self.track_target(pan_speed, tilt_speed)
 
         # fix elevation
         # # ==========================================
@@ -344,7 +421,7 @@ class OpticalDetector:
         #     self.track_target(0.0, y_speed)
         #     target_found_during_tilt = self._sleep_and_check_lock(time_to_tilt)
 
-        #     stop_camera(self.ptz, self.move_req)
+        #     self.track_target(0.0, 0.0)
         #     self.current_tilt = target_tilt
 
         #     if target_found_during_tilt:
@@ -355,7 +432,7 @@ class OpticalDetector:
         # # STEP 3: STATIONARY STARE (VERIFY YOLO DETECTION)
         # # ==========================================
         # logging.info(f"[Optical] Camera stationary at Pan: {safe_target}°, Tilt: {target_tilt}°. Waiting for YOLO lock...")
-        # stop_camera(self.ptz, self.move_req)
+        # self.track_target(0.0, 0.0)
 
         # # Stand completely still for 1.5 seconds to let focus & GStreamer buffer settle, checking YOLO continuously
         # target_acquired = self._sleep_and_check_lock(1.5)
@@ -381,10 +458,10 @@ class OpticalDetector:
         # self.track_target(0.0, -config.MOVE_SPEED) # Send motor DOWN
         
         # if self._sleep_and_check_lock(config.TILT_TIME_END_TO_END):
-        #     stop_camera(self.ptz, self.move_req)
+        #     self.track_target(0.0, 0.0)
         #     logging.info("[Optical] Target detected while resetting tilt!")
         #     return
-        # stop_camera(self.ptz, self.move_req)
+        # self.track_target(0.0, 0.0)
 
         # # 2B. Execute step-by-step vertical scan
         # # Limited to 20 sweeps to prevent infinite loop if drone flies away
@@ -404,7 +481,7 @@ class OpticalDetector:
             
         #     # Wait for step to finish, abort immediately if YOLO sees the drone
         #     target_found = self._sleep_and_check_lock(time_per_step)
-        #     stop_camera(self.ptz, self.move_req)
+        #     self.track_target(0.0, 0.0)
             
         #     if target_found:
         #         logging.info(f"*** TARGET VISUALLY ACQUIRED at ~{current_tilt} degrees! ***")
@@ -425,4 +502,4 @@ class OpticalDetector:
         #         current_tilt = config.MIN_TILT
                 
         # # Ensure motor is stopped when scan finishes or aborts
-        # stop_camera(self.ptz, self.move_req)
+        # # self.track_target(0.0, 0.0)

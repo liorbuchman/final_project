@@ -11,6 +11,8 @@ import usb.core
 import usb.util
 import config
 import libusb_package
+import queue
+import threading
 from uav_acoustic.model import SmallCNN                  
 from uav_acoustic.respeaker_usb_led import ReSpeakerV31Leds
 
@@ -62,10 +64,39 @@ class AcousticDetector:
         # Connect to the integrated LED controller
         try:
             self.leds = ReSpeakerV31Leds()
-            self.leds.mono(0x001100) # Soft Green
         except Exception as e:
             self.leds = None
             logger.error(f"Failed to initialize ReSpeaker LEDs: {e}")
+
+        self.current_led_color = None
+        self.led_queue = queue.Queue(maxsize=2)
+        self.led_worker_running = True
+        self.led_thread = threading.Thread(target=self._led_worker_loop, daemon=True, name="LED_Worker")
+        self.led_thread.start()
+        self.set_led_color(0x001100)#green
+
+    def _led_worker_loop(self):
+        """Threaded loop to asynchronously update LED colors without blocking the main audio processing."""
+        while self.led_worker_running:
+            try:
+                color = self.led_queue.get(timeout=0.5)
+                if self.leds:
+                    self.leds.mono(color)
+            except queue.Empty:
+                pass
+            except Exception as e:
+                logger.error(f"[LED Worker] USB communication error: {e}")
+
+    def set_led_color(self, color_hex):
+        """Updates the LED color only if it has changed, and queues the update for asynchronous processing."""
+        if self.current_led_color != color_hex:
+            if self.led_queue.full():
+                try:
+                    self.led_queue.get_nowait() 
+                except queue.Empty:
+                    pass
+            self.led_queue.put(color_hex)
+            self.current_led_color = color_hex
 
     def load_model(self):
         print("[Acoustic] Loading neural network checkpoints and weights...")
@@ -142,7 +173,7 @@ class AcousticDetector:
                 self.is_triggered = False
                 self.lock_initialized = False
                 if self.leds:
-                    self.leds.mono(0x001100) # Soft Green
+                    self.set_led_color(0x001100) # Soft Green
                 return 0.0
         
         # Normalize chunk for CNN matching
@@ -178,14 +209,14 @@ class AcousticDetector:
             
             logger.warning(f"DRONE HARDWARE TRACKING - Conf: {prediction_score:.4f} | Hardware Azimuth: {self.current_azimuth:.1f}°")
             if self.leds:
-                self.leds.mono(0xFF0000) # Bright Red
+                self.set_led_color(0xFF0000) # Bright Red
         else:
             if self.is_triggered:
                 logger.info("EVENT END - Target tracking lost or cleared.")
             self.is_triggered = False
             self.lock_initialized = False
             if self.leds:
-                self.leds.mono(0x001100) # Soft Green
+                 self.set_led_color(0x001100) # Soft Green
                 
         return prediction_score
 

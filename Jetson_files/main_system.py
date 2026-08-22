@@ -20,13 +20,14 @@ from uav_acoustic.acoustic_processor import AcousticDetector
 from uav_vision.optical_processor import OpticalDetector
 
 class SystemState(Enum):
+    CALIBRATING = 0 
     SCANNING = 1    # Idle/Acoustic Search
     TRACKING = 2    # Moving camera to acoustic DOA / Scanning visually
     ENGAGED = 3     # Visual lock acquired, YOLO tracking active
 
 class ComrandInBattle:
     def __init__(self):
-        self.state = SystemState.SCANNING
+        self.state = SystemState.CALIBRATING
         self.running = True
         self.state_timestamp = time.time()
         
@@ -92,7 +93,6 @@ class ComrandInBattle:
         # Initialize ONVIF camera
         try:
             self.video_processor.initialize_hardware()
-            #self.video_processor.auto_calibrate_and_home()
             if getattr(self.video_processor, 'ptz', None) is None:
                 self.optical_hw_status = "UNAVAILABLE"
         except Exception as video_err:
@@ -100,6 +100,9 @@ class ComrandInBattle:
             self.optical_hw_status = "UNAVAILABLE"
 
         # Spawn independent background threads
+        calib_thread = threading.Thread(target=self.calibration_routine, daemon=True, name="CalibThread")
+        calib_thread.start()
+
         audio_thread = threading.Thread(target=self.acoustic_background_loop, daemon=True, name="AcousticThread")
         audio_thread.start()
 
@@ -108,6 +111,19 @@ class ComrandInBattle:
 
         # Run optical pipeline (Video streaming & YOLO) on the main thread
         self.optical_master_loop()
+
+    def calibration_routine(self):
+        """Performs initial calibration of the PTZ camera and sets the system to SCANNING mode."""
+        with self.data_lock:
+            cam_ok = (self.optical_hw_status != "UNAVAILABLE")
+            
+        if cam_ok:
+            self.video_processor.auto_calibrate_and_home()
+            
+        with self.data_lock:
+            self.state = SystemState.SCANNING
+            self.state_timestamp = time.time()
+        logging.info("[System] Calibration Phase Complete. Grid is now active in SCANNING mode.")
 
     def acoustic_background_loop(self):
         """Continuous audio capture and processing loop running on a dedicated thread."""
@@ -207,7 +223,10 @@ class ComrandInBattle:
                 current_state = self.state
 
             # --- Finite State Machine Logic ---
-            if current_state == SystemState.SCANNING:
+            if current_state == SystemState.CALIBRATING:
+                # Wait for calibration to complete
+                pass
+            elif current_state == SystemState.SCANNING:
                 if audio_alert:
                     logging.info(f"[FSM] Drone detected acoustically at {target_azimuth}°. Transitioning to TRACKING.")
                     with self.data_lock:
@@ -345,7 +364,7 @@ class ComrandInBattle:
             can_shutdown_motors = (self.optical_hw_status == "ONLINE")
         if can_shutdown_motors:
             try:
-                self.video_processor.track_target(0, 0)
+                self.video_processor.track_target(0, 0, wait=True)
             except Exception:
                 pass
         cap.release()
@@ -365,7 +384,7 @@ if __name__ == "__main__":
         
         if DroneSystem.optical_hw_status == "ONLINE":
             try:
-                DroneSystem.video_processor.track_target(0.0, 0.0)
+                DroneSystem.video_processor.track_target(0.0, 0.0, wait=True)
                 logging.info("[System] PTZ motors stopped securely.")
             except Exception as e:
                 logging.error(f"[System] Failed to stop PTZ motors during shutdown: {e}")

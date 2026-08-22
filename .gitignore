@@ -38,3 +38,9 @@ Thumbs.db
 
 # gui_dashboard runtime state
 gui_dashboard/config.json
+
+# gui_dashboard recorded training frames (already covered by recordings/ above,
+# listed explicitly too since these can grow large fast)
+gui_dashboard/recordings/frames_*/
+gui_dashboard/recordings/acoustic_*/
+gui_dashboard/recordings/*.jsonl
