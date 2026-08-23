@@ -75,6 +75,26 @@ AUDIO_RING_MAX_S = 5.0
 _audio_lock = threading.Lock()
 _audio_ring: Optional[np.ndarray] = None
 
+# --- Per-pipeline-stage latency, for the GUI's "Pipeline Latency" tab ---
+# Each value is a plain time.perf_counter() delta around a call the untouched
+# Jetson_files code already makes - no extra work is performed, only timed.
+_stage_lock = threading.Lock()
+_stage_timings = {
+    "fft_ms": 0.0,
+    "cnn_ms": 0.0,
+    "yolo_ms": 0.0,
+    "frame_capture_ms": 0.0,
+    "ptz_ms": 0.0,
+}
+_logmel_ran_this_call = False  # cnn_ms is only meaningful when compute_live_logmel
+                                # actually ran during the *current* process_audio_buffer
+                                # call (it's skipped entirely under the energy gate)
+
+# Real mel-spectrogram (dB scale, straight from compute_live_logmel - literally
+# what the CNN itself just classified) for the "Audio Analytics" tab. None until
+# the first non-silent audio chunk has been processed.
+_latest_spectrogram: Optional[np.ndarray] = None
+
 
 def _patch_video_capture():
     """optical_master_loop's cv2.imshow call is the only place the fully
@@ -92,22 +112,71 @@ def _patch_video_capture():
     cv2.destroyAllWindows = lambda *_a, **_kw: None
 
 
+def _patch_frame_capture_timing():
+    """optical_master_loop's cap.read() (cv2.VideoCapture instance method) is
+    the actual GStreamer frame-fetch call. There's exactly one VideoCapture
+    instance anywhere in this codebase, so patching the class method globally
+    is safe and precise - purely a timing wrap, the real read() runs as-is."""
+    original_read = cv2.VideoCapture.read
+
+    def timed_read(self, *args, **kwargs):
+        t0 = time.perf_counter()
+        result = original_read(self, *args, **kwargs)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        with _stage_lock:
+            _stage_timings["frame_capture_ms"] = elapsed_ms
+        return result
+
+    cv2.VideoCapture.read = timed_read
+
+
 def _patch_acoustic_confidence(acoustic_detector_cls):
     """process_audio_buffer already computes and returns a live confidence
     score every audio chunk; main_system.py's acoustic_background_loop just
     never captures it. Wrap, don't touch the DSP/CNN logic itself. Also feeds
     the rolling audio ring buffer from the same raw_buffer, for the acoustic
-    sample recorder - one extra read, no new hook into main_system.py."""
+    sample recorder - one extra read, no new hook into main_system.py.
+
+    Also wraps compute_live_logmel (called from inside process_audio_buffer)
+    to time the FFT/mel-spectrogram stage on its own and capture the actual
+    matrix the CNN sees, for the latency breakdown + real spectrogram display.
+    CNN time is derived as (total call time - logmel time); the forward pass
+    itself is inline code inside process_audio_buffer, not a separately
+    wrappable method, so this is an approximation, not an independent
+    measurement - documented as such in the GUI."""
     original = acoustic_detector_cls.process_audio_buffer
+    original_logmel = acoustic_detector_cls.compute_live_logmel
+
+    def wrapped_logmel(self, y):
+        global _logmel_ran_this_call, _latest_spectrogram
+        t0 = time.perf_counter()
+        result = original_logmel(self, y)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        with _stage_lock:
+            _stage_timings["fft_ms"] = elapsed_ms
+            _logmel_ran_this_call = True
+            _latest_spectrogram = result.copy()
+        return result
 
     def wrapped(self, raw_buffer):
+        global _latest_acoustic_confidence, _logmel_ran_this_call
+        with _stage_lock:
+            _logmel_ran_this_call = False
+        t0 = time.perf_counter()
         score = original(self, raw_buffer)
-        global _latest_acoustic_confidence
+        total_ms = (time.perf_counter() - t0) * 1000.0
         with _state_lock:
             _latest_acoustic_confidence = float(score)
+        with _stage_lock:
+            # If the energy gate short-circuited this call, compute_live_logmel
+            # never ran - leave fft_ms/cnn_ms at their last real values instead
+            # of deriving nonsense from a call that did no DSP/CNN work at all.
+            if _logmel_ran_this_call:
+                _stage_timings["cnn_ms"] = max(0.0, total_ms - _stage_timings["fft_ms"])
         _update_audio_ring(raw_buffer)
         return score
 
+    acoustic_detector_cls.compute_live_logmel = wrapped_logmel
     acoustic_detector_cls.process_audio_buffer = wrapped
 
 
@@ -158,6 +227,45 @@ def get_audio_sample_rate() -> int:
     return getattr(_config_module, "SAMPLE_RATE", 16000)
 
 
+def get_waveform_preview(n_points: int = 128) -> list:
+    """Decimated preview of the live raw audio ring, normalized to -1..1 -
+    display-only (matches the SPEC.md waveform panel format), not the actual
+    DSP input the CNN uses."""
+    with _audio_lock:
+        ring = None if _audio_ring is None else _audio_ring.copy()
+    if ring is None or len(ring) == 0:
+        return []
+    idx = np.linspace(0, len(ring) - 1, min(n_points, len(ring))).astype(int)
+    samples = ring[idx].astype(np.float32) / 32768.0
+    return [round(float(s), 4) for s in samples]
+
+
+def get_latest_spectrogram_uint8() -> Optional[np.ndarray]:
+    """The real mel-spectrogram (dB scale) compute_live_logmel just produced -
+    literally what the CNN classified - normalized and resized to SPEC_ROWS x
+    SPEC_COLS uint8 for the canvas. None until the first non-silent chunk."""
+    with _stage_lock:
+        spec = None if _latest_spectrogram is None else _latest_spectrogram.copy()
+    if spec is None:
+        return None
+    # librosa.power_to_db(ref=np.max) always tops out at 0 dB; -80 dB is the
+    # conventional noise floor for display purposes.
+    norm = np.clip((spec + 80.0) / 80.0, 0.0, 1.0)
+    img = (norm * 255).astype(np.uint8)
+    return cv2.resize(img, (SPEC_COLS, SPEC_ROWS), interpolation=cv2.INTER_NEAREST)
+
+
+def get_stage_timings() -> dict:
+    """Per-pipeline-stage latency snapshot for the GUI's Pipeline Latency tab.
+    mic_buffer_ms is not a measurement - it's the fixed capture window size
+    from config (STEP_SECS), since the blocking mic read is deterministic by
+    construction and there's no meaningful "latency" to instrument there."""
+    with _stage_lock:
+        d = dict(_stage_timings)
+    d["mic_buffer_ms"] = getattr(_config_module, "STEP_SECS", 0.2) * 1000.0 if _config_module else 0.0
+    return d
+
+
 def _patch_vision_confidence(optical_detector_cls):
     """Taps the YOLO model's own track() call so run_inference's hysteresis
     (YOLO_LOW/HIGH_CONF_THRESHOLD lock-hold logic), box-drawing, and
@@ -179,13 +287,17 @@ def _patch_vision_confidence(optical_detector_cls):
         original_track = self.model.track
 
         def wrapped_track(source, **kwargs):
+            t0 = time.perf_counter()
             results = original_track(source, **kwargs)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             conf = 0.0
             if results and len(results[0].boxes) > 0:
                 conf = float(results[0].boxes.conf[0].item())
             global _latest_vision_confidence
             with _state_lock:
                 _latest_vision_confidence = conf
+            with _stage_lock:
+                _stage_timings["yolo_ms"] = elapsed_ms
             return results
 
         self.model.track = wrapped_track
@@ -193,10 +305,63 @@ def _patch_vision_confidence(optical_detector_cls):
     optical_detector_cls.initialize_hardware = patched_init
 
 
-def activate() -> bool:
+def _patch_ptz_timing(optical_processor_module):
+    """move_camera (imported into optical_processor's namespace with
+    `from uav_vision.camera_AC import ... move_camera ...`) is where the
+    actual ONVIF ContinuousMove SOAP call happens - the real, meaningful
+    "camera movement" latency (network round-trip to the motors), not the
+    near-instant in-process queue.put() in track_target(). Patching the name
+    bound in optical_processor's module globals affects _ptz_worker_loop's
+    call to it, since Python resolves globals at call time, not def time.
+    Most calls return early (velocity unchanged, no HTTP sent at all) - near-0
+    ptz_ms most ticks is correct, not a bug."""
+    original_move = optical_processor_module.move_camera
+
+    def timed_move(ptz, request, x, y):
+        t0 = time.perf_counter()
+        result = original_move(ptz, request, x, y)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        with _stage_lock:
+            _stage_timings["ptz_ms"] = elapsed_ms
+        return result
+
+    optical_processor_module.move_camera = timed_move
+
+
+def _patch_init_logging(main_system_module, dashboard_handler):
+    """ComrandInBattle.init_logging() (the first line of initialize_system(),
+    called synchronously on the DroneSystem thread before anything else) calls
+    logging.basicConfig(..., force=True), which strips every handler already
+    attached to the root logger. Since main_system.py's own logging (bare
+    logging.info/warning/error calls) and acoustic_processor.py's/
+    optical_processor.py's named loggers all propagate to root - not to the
+    dashboard's own "dashboard" logger - the GUI's WebSocketLogHandler must
+    live on root to see any of it. Re-attaching right after the original call
+    returns is deterministic (no sleep/poll needed): this wrap runs on the
+    same thread, synchronously, before any other logging setup can occur."""
+    if dashboard_handler is None:
+        return
+    original_init_logging = main_system_module.ComrandInBattle.init_logging
+
+    def wrapped_init_logging(self):
+        original_init_logging(self)
+        root = logging.getLogger()
+        if dashboard_handler not in root.handlers:
+            root.addHandler(dashboard_handler)
+
+    main_system_module.ComrandInBattle.init_logging = wrapped_init_logging
+
+
+def activate(dashboard_handler=None) -> bool:
     """Brings the real hardware stack online in this process. Returns True
     on success. Never raises - any failure (missing deps, not on a Jetson)
-    leaves the caller free to fall back to the simulated pipelines."""
+    leaves the caller free to fall back to the simulated pipelines.
+
+    dashboard_handler: main.py's WebSocketLogHandler instance, so the
+    init_logging patch can re-attach it to the root logger after
+    main_system.py's own basicConfig(force=True) wipes it - see
+    _patch_init_logging. Optional only so this module stays importable/
+    testable without main.py's logging setup."""
     global DroneSystem, _config_module, _activated
     if _activated:
         return True
@@ -213,13 +378,17 @@ def activate() -> bool:
         import config as jetson_config
         from uav_acoustic.acoustic_processor import AcousticDetector
         from uav_vision.optical_processor import OpticalDetector
+        import uav_vision.optical_processor as optical_processor_module
     except Exception as exc:
         logger.error("Hardware stack unavailable (%s) - staying simulated", exc)
         return False
 
     _patch_video_capture()
+    _patch_frame_capture_timing()
     _patch_acoustic_confidence(AcousticDetector)
     _patch_vision_confidence(OpticalDetector)
+    _patch_ptz_timing(optical_processor_module)
+    _patch_init_logging(main_system, dashboard_handler)
 
     _config_module = jetson_config
     DroneSystem = main_system.ComrandInBattle()
@@ -379,11 +548,12 @@ class HardwareAudioPipeline:
         with DroneSystem.data_lock:
             doa = DroneSystem.acoustic_azimuth
         conf = round(_latest_acoustic_confidence, 3)
+        spec = get_latest_spectrogram_uint8()
         return self._AudioResult(
             confidence=conf,
             doa_deg=round(doa, 1),
             db=None,
-            waveform=[],
-            spectrogram=np.zeros((SPEC_ROWS, SPEC_COLS), dtype=np.uint8),
+            waveform=get_waveform_preview(),
+            spectrogram=spec if spec is not None else np.zeros((SPEC_ROWS, SPEC_COLS), dtype=np.uint8),
             sensor_ts=time.time(),
         )

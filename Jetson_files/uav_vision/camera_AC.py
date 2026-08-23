@@ -127,10 +127,9 @@ def set_light_raw(ptz_url, profile_token, command):
             print(f"Failed! (HTTP {response.status_code})")
     except requests.exceptions.RequestException as e:
         print(f"Network Error! {e}")
-        response = requests.post(ptz_url, data=xml_payload, headers=headers, auth=HTTPDigestAuth(USER, PASS), timeout=2)
-        if response.status_code == 200:
-            print("OK!")
-        else:
-            print(f"Failed! (HTTP {response.status_code})")
-    except requests.exceptions.RequestException as e:
-        print(f"Network Error! {e}")
+        try:
+            response = requests.post(ptz_url, data=xml_payload, headers=headers, auth=HTTPDigestAuth(USER, PASS), timeout=2)
+            if response.status_code == 200: print("OK (on retry)!")
+            else: print(f"Failed on retry! (HTTP {response.status_code})")
+        except requests.exceptions.RequestException as retry_e:
+            print(f"Total Network Failure: {retry_e}")

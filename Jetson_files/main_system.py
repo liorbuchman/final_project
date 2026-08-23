@@ -319,8 +319,7 @@ class ComrandInBattle:
 
             # Process frame
             if frame_fetched and frame is not None:
-                frame = cv2.flip(frame, -1)
-                inference_frame = cv2.resize(frame, (config.FRAME_WIDTH, config.FRAME_HEIGHT), interpolation=cv2.INTER_LINEAR)
+                inference_frame  = frame
 
                 # Only run heavy YOLO inference if we are searching or tracking
                 if current_state in [SystemState.TRACKING, SystemState.ENGAGED]:

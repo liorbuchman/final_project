@@ -22,11 +22,6 @@ except ImportError:
     pass
 
 logger = logging.getLogger("AcousticSystem")
-logger.setLevel(logging.INFO)
-os.makedirs("logs", exist_ok=True)
-file_handler = logging.FileHandler("logs/acoustic_system.log")
-file_handler.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s'))
-logger.addHandler(file_handler)
 
 class AcousticDetector:
     def __init__(self):
@@ -43,11 +38,11 @@ class AcousticDetector:
         self.candidate_azimuth = 0.0
 
         # Exact DSP matching parameters from config (Single Source of Truth)
-        self.sr = 16000
-        self.n_mels = 128
-        self.n_fft = 1024
-        self.hop_length = 256
-        self.fixed_length = 63
+        self.sr = config.SAMPLE_RATE
+        self.n_mels = config.MEL_N_MELS
+        self.n_fft = config.MEL_N_FFT
+        self.hop_length = config.MEL_HOP_LENGTH
+        self.fixed_length = config.MEL_FIXED_LENGTH
 
         # Connect to the raw XMOS USB interface for hardware parameter tuning
         try:
@@ -167,7 +162,7 @@ class AcousticDetector:
         # Step 1: Energy Gating Check (Problem 1 - prevents false positives from background noise)
         rms_energy = float(np.sqrt(np.mean(y_chunk ** 2)))
         if getattr(config, 'ENABLE_ENERGY_GATE', True):
-            if rms_energy < getattr(config, 'AUDIO_MIN_RMS_THRESHOLD', 0.015):
+            if rms_energy < getattr(config, 'AUDIO_MIN_RMS_THRESHOLD', 0.025):
                 if self.is_triggered:
                     logger.info(f"EVENT END - Energy below threshold (RMS: {rms_energy:.4f})")
                 self.is_triggered = False

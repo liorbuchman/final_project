@@ -85,18 +85,6 @@ const SLIDER_DEFS = [
     tip: "Confirmed-lock ceiling: once confidence clears this value the visual lock is confirmed and held even if it later dips back toward the low threshold (hysteresis)." },
   { key: "audio_threshold", label: "Acoustic CNN Threshold", min: 0, max: 1, step: 0.01, liveHardware: true,
     tip: "Probability cutoff for the Audio CNN classifier to trigger an acoustic detection alarm." },
-  { key: "fusion_window_ms", label: "Sensor Fusion Window (ms)", min: 100, max: 2000, step: 10, liveHardware: false,
-    tip: "The time window in which visual and acoustic detections must overlap to trigger a combined system alarm." },
-  { key: "audio_gain", label: "Audio Gain / Pre-amp", min: 1, max: 10, step: 0.1, liveHardware: false,
-    tip: "Digital multiplier applied to raw audio streams before spectrogram generation." },
-  { key: "nms_threshold", label: "NMS Threshold", min: 0.1, max: 0.9, step: 0.01, liveHardware: false,
-    tip: "IoU overlap threshold for filtering duplicate YOLO bounding boxes on the same target." },
-  { key: "slew_timeout_s", label: "Slew Window Timeout (s)", min: 1.0, max: 5.0, step: 0.1, liveHardware: false,
-    tip: "The duration in seconds the system waits for mechanical stabilization of the PTZ camera before initiating YOLO tracking loop." },
-  { key: "lost_lock_timeout_s", label: "Lost Lock Timeout (s)", min: 1.0, max: 10.0, step: 0.1, liveHardware: false,
-    tip: "The time window the system tolerates an obscured visual track before declaring a false alarm and reverting to acoustic searching." },
-  { key: "audio_buffer_size", label: "Acoustic Buffer Frame Size", min: 128, max: 1024, step: 32, liveHardware: false,
-    tip: "Controls the length of the audio frame buffer used for generating the raw spectrogram before feeding it into the Acoustic CNN classifier." },
 ];
 
 function beep() {
@@ -146,7 +134,7 @@ function App() {
   const [frameRecordIntervalInput, setFrameRecordIntervalInput] = useState("1.0");
   const [frameRecordMaxInput, setFrameRecordMaxInput] = useState("1200");
   const [acousticRecording, setAcousticRecording] = useState(false);
-  const [acousticAutoSaveDrone, setAcousticAutoSaveDrone] = useState(true);
+  const [acousticAutoSaveDrone, setAcousticAutoSaveDrone] = useState(false);
   const [acousticDroneCount, setAcousticDroneCount] = useState(0);
   const [acousticNoiseCount, setAcousticNoiseCount] = useState(0);
   const [acousticMaxSamples, setAcousticMaxSamples] = useState(300);
@@ -400,7 +388,32 @@ function App() {
   const camera = telemetry?.camera || { connected: false, fps: 0 };
   const audio = telemetry?.audio || { active: false, db: null };
   const jetson = telemetry?.jetson || { cpu: null, gpu: null, temp_c: null };
-  const TABS = ["System Logs", "Performance Charts", "Detection Events"];
+  const TABS = ["System Logs", "Pipeline Latency", "Audio Analytics", "Detection Events"];
+
+  const LATENCY_STAGES = [
+    { key: "mic_buffer_ms", label: "Microphone Buffer", tip: "Fixed by config (STEP_SECS) - the mic capture window size, not a measured delay." },
+    { key: "fft_ms", label: "FFT / Mel-Spectrogram", tip: "Time to compute the log-mel spectrogram from the raw audio window (compute_live_logmel)." },
+    { key: "cnn_ms", label: "Audio CNN Inference", tip: "Approximate: derived as (total audio processing time - FFT time). The forward pass isn't independently measurable." },
+    { key: "frame_capture_ms", label: "Camera Frame Capture", tip: "Time for cv2.VideoCapture.read() to return a frame from the GStreamer pipeline." },
+    { key: "yolo_ms", label: "YOLO / Tracking Inference", tip: "Time for the model.track() call. Only runs while TRACKING/ENGAGED - 0 elsewhere by design." },
+    { key: "ptz_ms", label: "PTZ Command Dispatch", tip: "ONVIF network round-trip to the camera motors. Near-zero most ticks - a command is only sent when the velocity vector actually changes." },
+  ];
+  const LATENCY_MAX_MS = 250;
+
+  // Groups stages by the actual thread that runs them in main_system.py, so
+  // the summary shows real per-thread load instead of a meaningless flat sum
+  // across unrelated threads. budgetKey, when set, is the cycle time that
+  // thread must stay under to keep up in real time (mic_buffer_ms = STEP_SECS,
+  // the acoustic thread's own step interval) - frame/PTZ threads have no fixed
+  // config-derived budget to compare against.
+  const THREAD_GROUPS = [
+    { label: "Acoustic Thread", keys: ["fft_ms", "cnn_ms"], budgetKey: "mic_buffer_ms",
+      tip: "FFT + CNN time, this thread's actual per-chunk work. Compared against its own capture window (STEP_SECS) - if it exceeds the budget, the thread is falling behind real-time audio." },
+    { label: "Vision Thread", keys: ["frame_capture_ms", "yolo_ms"], budgetKey: null,
+      tip: "Frame capture + YOLO time, this thread's work per frame. No fixed budget here - compare against the camera's actual frame interval to see if processing keeps up." },
+    { label: "PTZ Worker Thread", keys: ["ptz_ms"], budgetKey: null,
+      tip: "ONVIF command dispatch time - runs on its own dedicated thread, isolated from acoustic/vision processing." },
+  ];
 
   return (
     <div className={(highContrast ? "hc " : "") + (state === "ENGAGED" ? "engaged-flash " : "") + "app-shell"}>
@@ -648,9 +661,6 @@ function App() {
             {hardwareMode && <span className="normal-case bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded text-[10px] font-normal">Inactive in Hardware Mode</span>}
           </div>
           <div className={"flex flex-col gap-3 " + (hardwareMode ? "opacity-40" : "")}>
-            {SLIDER_DEFS.filter(def => !def.liveHardware).map(def => (
-              <SliderControl key={def.key} def={def} settings={settings} pending={pending} connected={connected} updateSetting={updateSetting} />
-            ))}
             <div title="Inverts the camera pan/tilt axes to dynamically compensate for the upside-down physical installation of the PTZ housing on the tactical rig."
               className={"p-1 flex items-center gap-2 " + (pending.invert_camera_vector ? "pending-ring rounded" : "")}>
               <input type="checkbox" disabled={!connected} checked={!!settings?.invert_camera_vector}
@@ -688,7 +698,50 @@ function App() {
             ))}
           </div>
 
-          <div className={(activeTab === "Performance Charts" ? "grid" : "hidden") + " grid-cols-3 gap-4"}>
+          <div className={(activeTab === "Pipeline Latency" ? "block" : "hidden")}>
+            <div className="text-xs text-gray-500 mb-3">Per-stage timing along the detection pipeline{!hardwareMode ? " — simulated demo values, no real pipeline to instrument" : ""}</div>
+            {telemetry?.stage_latency_ms && (
+              <div className="mb-4 pb-3 border-b border-gray-800">
+                <div className="text-xs text-gray-500 mb-2">Load per thread</div>
+                {THREAD_GROUPS.map(g => {
+                  const val = g.keys.reduce((sum, k) => sum + (telemetry.stage_latency_ms[k] || 0), 0);
+                  const budget = g.budgetKey ? telemetry.stage_latency_ms[g.budgetKey] : null;
+                  const pct = budget ? Math.min(100, (val / budget) * 100) : Math.min(100, (val / LATENCY_MAX_MS) * 100);
+                  const over = budget != null && val > budget;
+                  return (
+                    <div key={g.label} className="mb-2" title={g.tip}>
+                      <div className="flex justify-between text-xs mb-1">
+                        <span className="text-gray-300">{g.label}</span>
+                        <span className={"tabular-nums font-semibold " + (over ? "text-red-400" : "text-emerald-400")}>
+                          {fmt(val,1)} ms{budget ? ` / ${fmt(budget,0)} ms budget` : ""}
+                        </span>
+                      </div>
+                      <div className="w-full bg-gray-800 rounded h-2 overflow-hidden">
+                        <div className={(over ? "bg-red-500" : "bg-emerald-500") + " h-2"} style={{ width: `${pct}%` }}></div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {LATENCY_STAGES.map(s => {
+              const val = telemetry?.stage_latency_ms?.[s.key];
+              const pct = val != null ? Math.min(100, (val / LATENCY_MAX_MS) * 100) : 0;
+              return (
+                <div key={s.key} className="mb-3" title={s.tip}>
+                  <div className="flex justify-between text-xs text-gray-400 mb-1">
+                    <span>{s.label}</span>
+                    <span className="tabular-nums">{val != null ? `${fmt(val,1)} ms` : "N/A"}</span>
+                  </div>
+                  <div className="w-full bg-gray-800 rounded h-2 overflow-hidden">
+                    <div className="bg-emerald-500 h-2" style={{ width: `${pct}%` }}></div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className={(activeTab === "Audio Analytics" ? "grid" : "hidden") + " grid-cols-3 gap-4"}>
             <div>
               <div className="text-xs text-gray-400 mb-1">Audio CNN — Drone vs Background</div>
               <div className="w-full bg-gray-800 rounded h-3 flex overflow-hidden">

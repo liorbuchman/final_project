@@ -26,7 +26,12 @@ IDVENDOR = 0x2886
 IDPRODUCT = 0x0018
 AUDIO_CHANNEL = 0
 AUDIO_CLASSIFICATION_THRESHOLD = 0.65
+#fft parameters
 SAMPLE_RATE = 16000
+MEL_HOP_LENGTH = 256
+MEL_N_FFT = 1024
+MEL_N_MELS = 128
+MEL_FIXED_LENGTH = 63
 WINDOW_SECS = 1.0
 STEP_SECS = 0.2
 RESPEAKER_INDEX = 0
@@ -34,7 +39,8 @@ SMOOTHING_WINDOW = 1
 ENABLE_ENERGY_GATE = True
 AUDIO_MIN_RMS_THRESHOLD = 0.025 #enrgey lower threshod -> going to be zero
 DOA_SMOOTHING_ALPHA = 0.35         
-DOA_MAX_JUMP_DEG = 30.0             
+DOA_MAX_JUMP_DEG = 30.0  
+DOA_OUTLIER_CONFIRM_COUNT = 3           
 
 #dsp card function  
 RESPEAKER_TUNE_DSP = True #endable DSP tuning for ReSpeaker V3.1
@@ -80,7 +86,7 @@ def get_gstreamer_pipeline():
         f"rtspsrc location={RTSP_URL} latency=0 drop-on-latency=true ! "
         "rtph265depay ! h265parse ! "
         "nvv4l2decoder disable-blk-pool=1 ! "
-        f"nvvidconv ! video/x-raw(memory:NVMM), width={FRAME_WIDTH}, height={FRAME_HEIGHT} ! "
+        f"nvvidconv flip-method=2 ! video/x-raw(memory:NVMM), width={FRAME_WIDTH}, height={FRAME_HEIGHT} ! "
         "nvvidconv ! video/x-raw, format=BGRx ! "
         "videoconvert ! video/x-raw, format=BGR ! "
         "appsink drop=true sync=false max-buffers=1"

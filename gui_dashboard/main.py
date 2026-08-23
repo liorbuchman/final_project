@@ -43,6 +43,11 @@ try:
 except ImportError:
     HAS_JTOP = False
 
+# Single persistent jtop session for the whole process lifetime (opened once in
+# on_startup, closed once in on_shutdown) - see start_jtop()/jetson_metrics()
+# below for why this must never be re-opened per poll.
+_jtop_handle = None
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 INDEX_HTML_PATH = BASE_DIR / "templates" / "index.html"
@@ -661,7 +666,7 @@ class AcousticRecordEngine:
     def __init__(self, directory: Path):
         self.directory = directory
         self.enabled = False           # armed: manual saves + auto-save both possible
-        self.auto_save_drone = True    # independent of `enabled` - toggle live, doesn't reset the session
+        self.auto_save_drone = False   # independent of `enabled` - toggle live, doesn't reset the session; off by default (noisy environments cause false triggers)
         self.window_s = 2.0
         self.max_samples = 300
         self.session_dir: Optional[Path] = None
@@ -845,14 +850,29 @@ log_history: deque = deque(maxlen=50)
 event_history: deque = deque(maxlen=100)
 
 
+LOG_THROTTLE_INTERVAL_S = 0.3  # per-logger cooldown for repeated INFO/WARNING
+                                # bursts (e.g. YOLO-lock or acoustic-trigger
+                                # logging once per frame/chunk in hardware
+                                # mode) - ERROR/CRITICAL are never throttled.
+_last_log_broadcast_by_logger: dict = {}
+
+
 class WebSocketLogHandler(logging.Handler):
-    """Pushes log records to all connected dashboards over the WS channel."""
+    """Pushes log records to all connected dashboards over the WS channel.
+    Attached to the ROOT logger (see on_startup/hardware_bridge.activate) so
+    it also catches Jetson_files' own logging, not just this module's."""
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
         super().__init__()
         self.loop = loop
 
     def emit(self, record: logging.LogRecord):
+        if record.levelno < logging.ERROR:
+            now = time.time()
+            last = _last_log_broadcast_by_logger.get(record.name, 0.0)
+            if now - last < LOG_THROTTLE_INTERVAL_S:
+                return
+            _last_log_broadcast_by_logger[record.name] = now
         payload = {
             "type": "log",
             "level": record.levelname,
@@ -927,18 +947,52 @@ def acoustic_recording_payload() -> dict:
     }
 
 
+def start_jtop():
+    """Opens the ONE jtop session for the process's entire lifetime. Must be
+    called exactly once, at server startup - never per poll. `jtop()`'s
+    connection setup is a blocking IPC handshake with the jetson-stats
+    background service; re-creating it every ~1s inside jetson_metrics() (as
+    this used to do, via `with jtop() as jetson:` on every call) blocked the
+    async event loop for tenths of a second each time, stalling the MJPEG
+    video stream running on that same loop and causing visible stutter.
+    Once started, jtop runs its own background thread that keeps
+    jetson.cpu/gpu/temperature updated in memory - jetson_metrics() below
+    just reads those (cheap, non-blocking)."""
+    global _jtop_handle
+    if not HAS_JTOP:
+        return
+    try:
+        handle = jtop()
+        handle.start()
+        _jtop_handle = handle
+        logger.info("jtop session opened (persistent for process lifetime)")
+    except Exception as exc:
+        logger.warning("jtop start failed (%s) - falling back to psutil", exc)
+        _jtop_handle = None
+
+
+def stop_jtop():
+    global _jtop_handle
+    if _jtop_handle is not None:
+        try:
+            _jtop_handle.close()
+        except Exception:
+            pass
+        _jtop_handle = None
+
+
 def jetson_metrics() -> dict:
     """jtop is authoritative on-device; psutil is the dev-machine fallback
-    (no real GPU/temp reading on non-Jetson hardware -> 'N/A')."""
-    if HAS_JTOP:
+    (no real GPU/temp reading on non-Jetson hardware -> 'N/A'). Reads the
+    single persistent session from start_jtop() - does NOT open a new one."""
+    if _jtop_handle is not None:
         try:
-            with jtop() as jetson:
-                if jetson.ok():
-                    return {
-                        "cpu": round(sum(jetson.cpu["cpu"][i]["user"] for i in jetson.cpu["cpu"]) / max(1, len(jetson.cpu["cpu"])), 1),
-                        "gpu": round(jetson.gpu.get("val", 0), 1),
-                        "temp_c": round(jetson.temperature.get("CPU", {}).get("temp", 0), 1),
-                    }
+            if _jtop_handle.ok():
+                return {
+                    "cpu": round(sum(_jtop_handle.cpu["cpu"][i]["user"] for i in _jtop_handle.cpu["cpu"]) / max(1, len(_jtop_handle.cpu["cpu"])), 1),
+                    "gpu": round(_jtop_handle.gpu.get("val", 0), 1),
+                    "temp_c": round(_jtop_handle.temperature.get("CPU", {}).get("temp", 0), 1),
+                }
         except Exception as exc:
             logger.warning("jtop read failed: %s", exc)
     if psutil is not None:
@@ -1025,6 +1079,23 @@ def _record_event_if_new(
     }
     event_history.append(ev)
     return ev
+
+
+STAGE_LATENCY_SIM_BASELINE = {
+    "mic_buffer_ms": 200.0,
+    "fft_ms": 15.0,
+    "cnn_ms": 8.0,
+    "frame_capture_ms": 5.0,
+    "yolo_ms": 25.0,
+    "ptz_ms": 2.0,
+}
+
+
+def fabricate_stage_latencies() -> dict:
+    """No real pipeline to instrument in simulated mode - small jitter around
+    plausible Jetson Orin Nano figures, purely for a consistent demo (same
+    fabrication approach already used for the compass strip)."""
+    return {k: round(max(0.0, v + random.uniform(-v * 0.2, v * 0.2)), 1) for k, v in STAGE_LATENCY_SIM_BASELINE.items()}
 
 
 async def telemetry_loop():
@@ -1128,6 +1199,7 @@ async def telemetry_loop():
                     "doa_deg": audio_result.doa_deg if audio_result else 0.0,
                 },
                 "waveform": audio_result.waveform if audio_result else [],
+                "stage_latency_ms": hardware_bridge.get_stage_timings() if runtime.hardware_active else fabricate_stage_latencies(),
                 "sensor_ts": (vision_result.sensor_ts if vision_result else (audio_result.sensor_ts if audio_result else now)),
                 "camera_pan_deg": round(camera_pan_deg, 1),
                 "frame_recording": {
@@ -1265,10 +1337,19 @@ async def on_startup():
     loop = asyncio.get_event_loop()
     handler = WebSocketLogHandler(loop)
     handler.setLevel(logging.INFO)
-    logger.addHandler(handler)
+    # Attached to the ROOT logger (not just "dashboard") so Jetson_files' own
+    # logging - main_system.py's bare logging.info/warning/error calls plus
+    # the "AcousticSystem"/"OpticalSystem" named loggers - reaches the GUI
+    # too, not just our own FSM-transition messages. This logger ("dashboard")
+    # already propagates to root by default, so nothing needs to attach there
+    # directly, avoiding a double-broadcast.
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
+
+    start_jtop()
 
     if os.environ.get("HARDWARE_MODE") == "1":
-        if hardware_bridge.activate():
+        if hardware_bridge.activate(handler):
             runtime.hardware_active = True
             runtime.hw_vision = hardware_bridge.HardwareVisionPipeline(VisionResult, VisionDetection)
             runtime.hw_audio = hardware_bridge.HardwareAudioPipeline(AudioResult)
@@ -1300,6 +1381,7 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     runtime.record_engine.stop()
+    stop_jtop()
 
 
 @app.get("/", response_class=HTMLResponse)

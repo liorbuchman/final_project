@@ -9,6 +9,8 @@ import threading
 from ultralytics import YOLO
 from uav_vision.camera_AC import setup_camera, move_camera, set_light_raw, stop_camera
 
+logger = logging.getLogger("OpticalSystem")
+
 class OpticalDetector:
     def __init__(self):
         self.model_path = config.YOLO_MODEL_PATH
@@ -24,6 +26,7 @@ class OpticalDetector:
         #error history for derivative term
         self.prev_error_x = 0.0
         self.prev_error_y = 0.0
+        self.error_lock = threading.Lock()
     
         self.ptz_queue = queue.Queue(maxsize=1) 
         self.ptz_worker_running = True
@@ -40,19 +43,19 @@ class OpticalDetector:
         are perfectly measured via a manual stopwatch test.
         """
         if self.ptz is None:
-            logging.error("[Calibration] PTZ connection missing!")
+            logger.error("[Calibration] PTZ connection missing!")
             return False
 
-        logging.info("[Calibration] STARTING DETERMINISTIC HOMING...")
+        logger.info("[Calibration] STARTING DETERMINISTIC HOMING...")
         
         # --- PAN CALIBRATION ---
         # 1. Drive to absolute Right limit
-        logging.info("[Calibration] Finding Pan Right Limit...")
+        logger.info("[Calibration] Finding Pan Right Limit...")
         self.track_target(-config.MOVE_SPEED, 0.0)
         time.sleep(config.PAN_TIME_END_TO_END + 2.0)
         
         # 2. Drive to Center
-        logging.info("[Calibration] Moving Pan to absolute Center...")
+        logger.info("[Calibration] Moving Pan to absolute Center...")
         self.track_target(config.MOVE_SPEED, 0.0)
         time.sleep(config.PAN_TIME_END_TO_END / 2.0)
         
@@ -62,12 +65,12 @@ class OpticalDetector:
 
         # --- TILT CALIBRATION ---
         # 1. Drive to absolute Bottom limit
-        logging.info("[Calibration] Finding Tilt Bottom Limit...")
+        logger.info("[Calibration] Finding Tilt Bottom Limit...")
         self.track_target(0.0, -config.MOVE_SPEED)
         time.sleep(config.TILT_TIME_END_TO_END + 2.0)
         
         # 2. Drive up to Default Elevation
-        logging.info(f"[Calibration] Moving Tilt to {config.DEFAULT_ELEVATION_ANGLE}°...")
+        logger.info(f"[Calibration] Moving Tilt to {config.DEFAULT_ELEVATION_ANGLE}°...")
         degrees_up = config.DEFAULT_ELEVATION_ANGLE - config.MIN_TILT
         time_up = degrees_up * config.TIME_PER_DEGREE_TILT
         
@@ -77,7 +80,7 @@ class OpticalDetector:
         self.track_target(0.0, 0.0) 
         self.current_tilt = config.DEFAULT_ELEVATION_ANGLE
 
-        logging.info("[Calibration] HOMING COMPLETE! Camera centered.")
+        logger.info("[Calibration] HOMING COMPLETE! Camera centered.")
         return True
     
     def initialize_hardware(self):
@@ -92,7 +95,7 @@ class OpticalDetector:
     def run_inference(self, frame):
         """Processes 640x480 frame matrices on GPU and extracts spatial target center errors."""
         if config.SAVE_LAST_FRAME_FLAG:
-            #logging.info(f"[DEBUG] Frame shape before YOLO: {frame.shape}")
+            #logger.info(f"[DEBUG] Frame shape before YOLO: {frame.shape}")
             cv2.imwrite("what_yolo_actually_sees.jpg", frame)
         use_half = (config.DEVICE.type == 'cuda')
         results = self.model.track(frame, 
@@ -106,7 +109,8 @@ class OpticalDetector:
         
         for r in results:
             if len(r.boxes) > 0:
-                box = r.boxes[0]
+                sorted_boxes = sorted(r.boxes, key=lambda b: float(b.conf[0]), reverse=True)
+                box =sorted_boxes[0]
                 yolo_conf = float(box.conf[0])
                 
 
@@ -118,14 +122,15 @@ class OpticalDetector:
                     self.visual_lock = True
                     detected_this_frame = True
                     yolo_conf_percent = int(yolo_conf * 100)
-                    logging.info(f"[YOLO] Drone visually detected! Visual Confidence: {yolo_conf:.2f}")
+                    logger.info(f"[YOLO] Drone visually detected! Visual Confidence: {yolo_conf:.2f}")
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     
                     center_x = (x1 + x2) // 2
                     center_y = (y1 + y2) // 2
-                    
-                    self.error_x = center_x - (config.FRAME_WIDTH // 2)
-                    self.error_y = center_y - (config.FRAME_HEIGHT // 2)
+
+                    with self.error_lock:
+                        self.error_x = center_x - (config.FRAME_WIDTH // 2)
+                        self.error_y = center_y - (config.FRAME_HEIGHT // 2)
                     
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
@@ -160,7 +165,7 @@ class OpticalDetector:
             except queue.Empty:
                 pass
             except Exception as e:
-                logging.error(f"[PTZ Worker] Error moving camera: {e}")
+                logger.error(f"[PTZ Worker] Error moving camera: {e}")
 
     def track_target(self, pan_speed, tilt_speed, wait=False):
         #move_camera(self.ptz, self.move_req, pan_speed, tilt_speed) # old version
@@ -185,6 +190,10 @@ class OpticalDetector:
             self.prev_error_y = 0.0
             self.prev_time = time.time() 
             return
+
+        with self.error_lock:
+            current_error_x = self.error_x
+            current_error_y = self.error_y
         
         
         current_time = time.time()
@@ -199,30 +208,30 @@ class OpticalDetector:
         tilt_speed = 0.0
         
         # --- X-Axis (Pan) Logic - PD ---
-        abs_error_x = abs(self.error_x)
+        abs_error_x = abs(current_error_x)
         if abs_error_x > deadzone_x:
            
-            delta_x = (self.error_x - self.prev_error_x) / dt 
+            delta_x = (current_error_x - self.prev_error_x) / dt 
             
-            p_term_x = self.error_x * config.KP_PAN
+            p_term_x = current_error_x * config.KP_PAN
             d_term_x = delta_x * config.KD_PAN
             
             raw_pan = -1.0 * (p_term_x + d_term_x)
             pan_speed = max(-1.0, min(1.0, raw_pan))
 
         # --- Y-Axis (Tilt) Logic - PD ---
-        abs_error_y = abs(self.error_y)
+        abs_error_y = abs(current_error_y)
         if abs_error_y > deadzone_y:
-            delta_y = (self.error_y - self.prev_error_y) / dt 
+            delta_y = (current_error_y - self.prev_error_y) / dt 
             
-            p_term_y = self.error_y * config.KP_TILT
+            p_term_y = current_error_y * config.KP_TILT
             d_term_y = delta_y * config.KD_TILT
             
             raw_tilt = (p_term_y + d_term_y) * config.TILT_DIRECTION_INVERSION
             tilt_speed = max(-1.0, min(1.0, raw_tilt))
 
-        self.prev_error_x = self.error_x
-        self.prev_error_y = self.error_y
+        self.prev_error_x = current_error_x
+        self.prev_error_y = current_error_y
 
         self.track_target(pan_speed, tilt_speed)
 
@@ -277,24 +286,34 @@ class OpticalDetector:
         direction, safe_target, degrees_to_move = self.calculate_pan_movement(target_azimuth)
 
         if abs(degrees_to_move) >= 2.0 and direction != "None":
-            logging.info(f"[Optical] Slew {direction} by {degrees_to_move:.1f} degrees (Target: {safe_target})...")
+            logger.info(f"[Optical] Slew {direction} by {degrees_to_move:.1f} degrees (Target: {safe_target})...")
             
             # Invert X axis based on hardware specifics (Right is negative)
             x_speed = -config.MOVE_SPEED if direction == "Right" else config.MOVE_SPEED
-            
             # Start pan motor
             self.track_target(x_speed, 0.0)
             sleep_time = degrees_to_move * config.TIME_PER_DEGREE_PAN
-            
+
             # Wait for movement to finish, BUT abort if YOLO sees the drone
+            start_time = time.time()
             target_found_during_pan = self._sleep_and_check_lock(sleep_time)
+            elapsed_time = time.time() - start_time
             
             # Stop motor and update software position state
             self.track_target(0.0, 0.0)
-            self.current_camera_pan = safe_target
-            
+            if target_found_during_pan and sleep_time > 0:
+                fraction = min(1.0, elapsed_time / sleep_time)
+                actual_moved = degrees_to_move * fraction
+
+                if direction == "Right":
+                    self.current_camera_pan -= actual_moved
+                else:
+                    self.current_camera_pan += actual_moved
+            else:
+                self.current_camera_pan = safe_target            
+
             if target_found_during_pan:
-                logging.info("[Optical] Target detected during PAN movement! Stopping search.")
+                logger.info(f"[Optical] Target detected during PAN! Stopped at ~{self.current_camera_pan:.1f}°")
                 return
 
         # If we already see the target, no need to tilt scan
@@ -308,7 +327,7 @@ class OpticalDetector:
         # We only need 3 stops to cover from 0 to 90 degrees.
         tilt_checkpoints = [20.0, 40.0, 80.0] 
         
-        logging.info("[Optical] Initiating Optimized Vertical Macro-Scan...")
+        logger.info("[Optical] Initiating Optimized Vertical Macro-Scan...")
 
         for target_tilt in tilt_checkpoints:
             if self.visual_lock:
@@ -318,7 +337,7 @@ class OpticalDetector:
             tilt_diff = target_tilt - current_tilt_val
             
             if abs(tilt_diff) >= 2.0:
-                logging.info(f"[Optical] Macro-Slewing TILT to {target_tilt}°...")
+                logger.info(f"[Optical] Macro-Slewing TILT to {target_tilt}°...")
                 y_speed = config.MOVE_SPEED if tilt_diff > 0 else -config.MOVE_SPEED
                 time_to_tilt = abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
                 
@@ -326,22 +345,33 @@ class OpticalDetector:
                 self.track_target(0.0, y_speed)
                 
                 # Sleep mostly blind, but keep a tiny chance to catch it mid-flight
+                start_time = time.time()
                 target_found_during_move = self._sleep_and_check_lock(time_to_tilt)
+                elapsed_time = time.time() - start_time
                 self.track_target(0.0, 0.0)
-                self.current_tilt = target_tilt
+
+                if target_found_during_move and time_to_tilt > 0:
+                    fraction = min(1.0, elapsed_time / time_to_tilt)
+                    actual_moved_tilt = abs(tilt_diff) * fraction
+                    if tilt_diff > 0:
+                        self.current_tilt += actual_moved_tilt
+                    else:
+                        self.current_tilt -= actual_moved_tilt
+                else:
+                    self.current_tilt = target_tilt
                 
                 if target_found_during_move:
-                    logging.info(f"[Optical] Target acquired during macro-slew to {target_tilt}°")
+                    logger.info(f"[Optical] Target acquired during macro-slew to {self.current_tilt:.1f}°")
                     break
 
             # --- 2. STARE (Settle and Detect) ---
-            logging.info(f"[Optical] Camera stationary at {target_tilt}°. Flushing buffer and staring...")
+            logger.info(f"[Optical] Camera stationary at {target_tilt}°. Flushing buffer and staring...")
             # 0.8 seconds is usually enough to flush the RTSP buffer and stabilize Autofocus.
             # During this time, we constantly ask YOLO "do you see it now?".
             target_found = self._sleep_and_check_lock(0.8) 
             
             if target_found:
-                logging.info(f"*** TARGET VISUALLY ACQUIRED at ~{target_tilt}°! ***")
+                logger.info(f"*** TARGET VISUALLY ACQUIRED at ~{self.current_tilt}°! ***")
                 break
 
         # old version of tracking the drone after YOLO detection 
@@ -412,7 +442,7 @@ class OpticalDetector:
         # tilt_diff = target_tilt - current_tilt_val
 
         # if abs(tilt_diff) >= 2.0:
-        #     logging.info(f"[Optical] Moving TILT to fixed middle elevation ({target_tilt}°)...")
+        #     logger.info(f"[Optical] Moving TILT to fixed middle elevation ({target_tilt}°)...")
             
         #     y_speed = config.MOVE_SPEED if tilt_diff > 0 else -config.MOVE_SPEED
         #     time_to_tilt = abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
@@ -425,41 +455,41 @@ class OpticalDetector:
         #     self.current_tilt = target_tilt
 
         #     if target_found_during_tilt:
-        #         logging.info("[Optical] Target detected while moving Tilt to center!")
+        #         logger.info("[Optical] Target detected while moving Tilt to center!")
         #         return
 
         # # ==========================================
         # # STEP 3: STATIONARY STARE (VERIFY YOLO DETECTION)
         # # ==========================================
-        # logging.info(f"[Optical] Camera stationary at Pan: {safe_target}°, Tilt: {target_tilt}°. Waiting for YOLO lock...")
+        # logger.info(f"[Optical] Camera stationary at Pan: {safe_target}°, Tilt: {target_tilt}°. Waiting for YOLO lock...")
         # self.track_target(0.0, 0.0)
 
         # # Stand completely still for 1.5 seconds to let focus & GStreamer buffer settle, checking YOLO continuously
         # target_acquired = self._sleep_and_check_lock(1.5)
 
         # if target_acquired:
-        #     logging.info("*** TARGET VISUALLY ACQUIRED BY YOLO! ***")
+        #     logger.info("*** TARGET VISUALLY ACQUIRED BY YOLO! ***")
         # else:
-        #     logging.info("[Optical] Stationary check finished - No visual lock acquired.")
+        #     logger.info("[Optical] Stationary check finished - No visual lock acquired.")
 
 
         #old version works good but is slow and can miss the target if it flies away during the tilt scan
         # # ==========================================
         # # STEP 2: VERTICAL SCAN (TILT SWEEP)
         # # ==========================================
-        # logging.info("[Optical] Initiating Vertical Scan...")
+        # logger.info("[Optical] Initiating Vertical Scan...")
         # current_tilt = config.MIN_TILT
         # scan_step = 20.0
         # direction_tilt = "Up"
         # time_per_step = scan_step * config.TIME_PER_DEGREE_TILT
 
         # # 2A. Reset Tilt to the bottom limit before scanning
-        # logging.info("[Optical] Resetting tilt to bottom limit...")
+        # logger.info("[Optical] Resetting tilt to bottom limit...")
         # self.track_target(0.0, -config.MOVE_SPEED) # Send motor DOWN
         
         # if self._sleep_and_check_lock(config.TILT_TIME_END_TO_END):
         #     self.track_target(0.0, 0.0)
-        #     logging.info("[Optical] Target detected while resetting tilt!")
+        #     logger.info("[Optical] Target detected while resetting tilt!")
         #     return
         # self.track_target(0.0, 0.0)
 
@@ -471,7 +501,7 @@ class OpticalDetector:
         #     if self.visual_lock:
         #         break
                 
-        #     logging.info(f"[Optical] Scanning at {current_tilt} degrees...")
+        #     logger.info(f"[Optical] Scanning at {current_tilt} degrees...")
             
         #     # Determine motor direction for this step
         #     y_speed = config.MOVE_SPEED if direction_tilt == "Up" else -config.MOVE_SPEED
@@ -484,7 +514,7 @@ class OpticalDetector:
         #     self.track_target(0.0, 0.0)
             
         #     if target_found:
-        #         logging.info(f"*** TARGET VISUALLY ACQUIRED at ~{current_tilt} degrees! ***")
+        #         logger.info(f"*** TARGET VISUALLY ACQUIRED at ~{current_tilt} degrees! ***")
         #         break
                 
         #     # Update math for next step
