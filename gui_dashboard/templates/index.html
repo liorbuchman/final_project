@@ -107,47 +107,112 @@ function fmt(n, d = 1) {
 }
 
 // The /video_feed multipart/x-mixed-replace stream's underlying network
-// request has been observed (devtools: Initiator "img", NS_BINDING_ABORTED)
-// getting silently aborted right after this <img> first mounts, while a
-// second, unrelated request to the same URL keeps flowing fine - leaving the
-// visible <img> permanently blank with nothing the JS side can reliably catch
-// (onerror doesn't fire consistently for a stream cut off mid-flight after
-// headers were already accepted). Rather than depend on onError alone, this
-// also refreshes on a fixed interval so a stuck connection recovers within
-// one cycle instead of staying dead for the rest of the session.
+// request, when loaded via a plain <img src="/video_feed">, has been observed
+// (devtools: Initiator "img", NS_BINDING_ABORTED, reproduced on both Chrome
+// and Firefox) getting silently aborted right after the <img> mounts, while a
+// second, unrelated request to the same URL keeps flowing fine - the <img>
+// element itself never reliably decodes this content-type. A plain src
+// refresh doesn't fix it (still fails almost every retry) - the most likely
+// explanation is that current browsers no longer treat
+// multipart/x-mixed-replace as valid content for the <img> "image"
+// destination at all, regardless of retries.
 //
-// The retry uses `key={nonce}` to force React to unmount the old <img> DOM
-// node and mount a genuinely new one, rather than just reassigning `src` on
-// the same element - merely changing `src` relies on the browser reliably
-// aborting the previous in-flight request on its own, which is exactly the
-// behavior that's already unreliable for this multipart stream (that's the
-// bug this component works around in the first place). An actual unmount is
-// the one thing every browser is guaranteed to treat as "stop this request" -
-// without it, a retry could leave the old connection dangling forever,
-// leaking one open server-side connection per retry for as long as the tab
-// stays open (this is suspected to have been the cause of a stuck/very slow
-// server shutdown - many leaked /video_feed connections all needing to be
-// force-cancelled at once).
+// Workaround: bypass <img> entirely. fetch() the same stream as raw bytes,
+// parse the multipart boundaries ourselves, and hand each extracted JPEG to
+// createImageBitmap() (the browser's own hardware-accelerated decoder - same
+// one <img> would have used) before drawing it to a <canvas> with
+// ctx.drawImage(). This is client-side only; the server, the byte stream, and
+// the frame rate are all unchanged. object-fit still applies to <canvas> the
+// same way it did to <img>, so canvas.width/height are set to each decoded
+// frame's real size and the same CSS classes reproduce identical letterboxing.
+const FRAME_BOUNDARY = new TextEncoder().encode("--frame");
+const HEADER_END = new TextEncoder().encode("\r\n\r\n");
+
+function indexOfBytes(haystack, needle, fromIndex) {
+  const limit = haystack.length - needle.length;
+  outer:
+  for (let i = fromIndex; i <= limit; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
 function VideoFeed() {
-  const [nonce, setNonce] = useState(0);
-  const retryTimer = useRef(null);
+  const canvasRef = useRef(null);
 
   useEffect(() => {
-    const id = setInterval(() => setNonce(n => n + 1), 30000);
-    return () => clearInterval(id);
+    const controller = new AbortController();
+    let cancelled = false;
+
+    async function drainFrames(buf) {
+      // Consumes as many complete JPEG parts as are currently buffered,
+      // decoding + drawing each one; returns whatever partial bytes are left
+      // over (an in-progress frame still waiting on more chunks).
+      while (true) {
+        const headerEnd = indexOfBytes(buf, HEADER_END, 0);
+        if (headerEnd === -1) return buf;
+        const jpegStart = headerEnd + HEADER_END.length;
+        const nextBoundary = indexOfBytes(buf, FRAME_BOUNDARY, jpegStart);
+        if (nextBoundary === -1) return buf; // this frame isn't fully in yet
+
+        const jpegEnd = nextBoundary - 2; // trim the "\r\n" before "--frame"
+        const jpegBytes = buf.slice(jpegStart, Math.max(jpegStart, jpegEnd));
+        buf = buf.slice(nextBoundary);
+
+        if (jpegBytes.length === 0) continue;
+        try {
+          const bitmap = await createImageBitmap(new Blob([jpegBytes], { type: "image/jpeg" }));
+          const canvas = canvasRef.current;
+          if (canvas && !cancelled) {
+            if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
+            if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
+            canvas.getContext("2d").drawImage(bitmap, 0, 0);
+          }
+          bitmap.close();
+        } catch (e) {
+          // Malformed part (e.g. "--frame" happened to occur inside binary
+          // JPEG data) - drop this one frame and keep the stream going.
+        }
+      }
+    }
+
+    async function run() {
+      while (!cancelled) {
+        try {
+          const resp = await fetch("/video_feed", { signal: controller.signal, cache: "no-store" });
+          if (!resp.body) throw new Error("no body");
+          const reader = resp.body.getReader();
+          let buf = new Uint8Array(0);
+
+          while (!cancelled) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const merged = new Uint8Array(buf.length + value.length);
+            merged.set(buf, 0);
+            merged.set(value, buf.length);
+            buf = await drainFrames(merged);
+          }
+        } catch (e) {
+          // Network error, or the abort() from cleanup below - either way,
+          // fall through to the reconnect delay (skipped if we're cancelled).
+        }
+        if (cancelled) return;
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+
+    run();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, []);
 
-  function handleError() {
-    if (retryTimer.current) return;
-    retryTimer.current = setTimeout(() => {
-      retryTimer.current = null;
-      setNonce(n => n + 1);
-    }, 1000);
-  }
-
   return (
-    <img key={nonce} src={`/video_feed?r=${nonce}`} onError={handleError}
-      className="absolute inset-0 w-full h-full object-contain bg-black" />
+    <canvas ref={canvasRef} className="absolute inset-0 w-full h-full object-contain bg-black" />
   );
 }
 
