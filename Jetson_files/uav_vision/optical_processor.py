@@ -66,7 +66,7 @@ class OpticalDetector:
         # --- TILT CALIBRATION ---
         # 1. Drive to absolute Bottom limit
         logger.info("[Calibration] Finding Tilt Bottom Limit...")
-        self.track_target(0.0, -config.MOVE_SPEED)
+        self.track_target(0.0, -config.MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
         time.sleep(config.TILT_TIME_END_TO_END + 2.0)
         
         # 2. Drive up to Default Elevation
@@ -74,7 +74,7 @@ class OpticalDetector:
         degrees_up = config.DEFAULT_ELEVATION_ANGLE - config.MIN_TILT
         time_up = degrees_up * config.TIME_PER_DEGREE_TILT
         
-        self.track_target(0.0, config.MOVE_SPEED)
+        self.track_target(0.0, config.MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
         time.sleep(time_up)
         
         self.track_target(0.0, 0.0) 
@@ -325,11 +325,10 @@ class OpticalDetector:
         # ==========================================
         # Assuming an effective vertical FOV of ~45 degrees.
         # We only need 3 stops to cover from 0 to 90 degrees.
-        tilt_checkpoints = [20.0, 40.0, 80.0] 
         
         logger.info("[Optical] Initiating Optimized Vertical Macro-Scan...")
 
-        for target_tilt in tilt_checkpoints:
+        for target_tilt in config.TILT_CHECKPOINTS:
             if self.visual_lock:
                 break
                 
@@ -338,7 +337,7 @@ class OpticalDetector:
             
             if abs(tilt_diff) >= 2.0:
                 logger.info(f"[Optical] Macro-Slewing TILT to {target_tilt}°...")
-                y_speed = config.MOVE_SPEED if tilt_diff > 0 else -config.MOVE_SPEED
+                y_speed = (config.MOVE_SPEED if tilt_diff > 0 else -config.MOVE_SPEED) * config.TILT_DIRECTION_INVERSION
                 time_to_tilt = abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
                 
                 # --- 1. MOVE (Fast Slew) ---

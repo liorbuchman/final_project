@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import os
 import time
 import sys
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(parent_dir)
 import config
 from uav_vision.camera_AC import setup_camera, move_camera, stop_camera
 
@@ -19,18 +22,18 @@ def main():
     
     # --- PAN CALIBRATION ---
     print("\n--- STEP 1: PAN CALIBRATION ---")
-    input("Press ENTER to move camera to the extreme LEFT...")
+    input("Press ENTER to move camera to the extreme RIGHT...")
     move_camera(ptz, move_req, -speed, 0.0)
-    input("Camera moving LEFT... Press ENTER exactly when it hits the mechanical limit (stops moving)!")
+    input("Camera moving RIGHT... Press ENTER exactly when it hits the mechanical limit (stops moving)!")
     stop_camera(ptz, move_req)
     time.sleep(1)
 
     print("\nReady to measure PAN time.")
-    input("Press ENTER to start moving RIGHT and begin the timer...")
+    input("Press ENTER to start moving LEFT and begin the timer...")
     start_time = time.time()
     move_camera(ptz, move_req, speed, 0.0)
     
-    input("Camera moving RIGHT... Press ENTER exactly when it hits the right mechanical limit!")
+    input("Camera moving LEFT... Press ENTER exactly when it hits the left mechanical limit!")
     pan_time = time.time() - start_time
     stop_camera(ptz, move_req)
     print(f">>> MEASURED PAN_TIME_END_TO_END: {pan_time:.3f} seconds")
@@ -38,8 +41,8 @@ def main():
 
     # --- TILT CALIBRATION ---
     print("\n--- STEP 2: TILT CALIBRATION ---")
-    input("Press ENTER to move camera to the extreme BOTTOM...")
-    move_camera(ptz, move_req, 0.0, -speed)
+    input("Press ENTER to move camera to the extreme BOTTOM (MIN_TILT)...")
+    move_camera(ptz, move_req, 0.0, -speed * config.TILT_DIRECTION_INVERSION)
     input("Camera moving DOWN... Press ENTER exactly when it hits the bottom mechanical limit!")
     stop_camera(ptz, move_req)
     time.sleep(1)
@@ -47,7 +50,7 @@ def main():
     print("\nReady to measure TILT time.")
     input("Press ENTER to start moving UP and begin the timer...")
     start_time = time.time()
-    move_camera(ptz, move_req, 0.0, speed)
+    move_camera(ptz, move_req, 0.0, speed * config.TILT_DIRECTION_INVERSION)
     
     input("Camera moving UP... Press ENTER exactly when it hits the top mechanical limit!")
     tilt_time = time.time() - start_time
@@ -65,25 +68,34 @@ def main():
     tilt_range = float(input("What is the total physical physical tilt range in degrees? (e.g., 90): "))
     time_per_deg_tilt = tilt_time / tilt_range
     print(f"[INFO] Calculated TIME_PER_DEGREE_TILT: {time_per_deg_tilt:.4f}s")
+
+    print("Resetting to bottom limit to establish baseline...")
+    move_camera(ptz, move_req, 0.0, -speed * config.TILT_DIRECTION_INVERSION)
+    time.sleep(tilt_time + 1.0)
+    stop_camera(ptz, move_req)
+    current_angle = 0.0
     
     while True:
         try:
             target_angle = float(input("\nEnter an elevation angle to test (or press Ctrl+C to quit): "))
+            delta_angle = target_angle - current_angle
+            time_to_move = abs(delta_angle) * time_per_deg_tilt
             
-            # Reset to bottom
-            print("Resetting to bottom limit...")
-            move_camera(ptz, move_req, 0.0, -speed)
-            time.sleep(tilt_time + 1.0)
-            stop_camera(ptz, move_req)
-            time.sleep(0.5)
+            if delta_angle == 0:
+                print("Already at this angle.")
+                continue
+
+            base_tilt_speed = speed if delta_angle > 0 else -speed
+            applied_tilt_speed = base_tilt_speed * config.TILT_DIRECTION_INVERSION
             
-            # Move to angle
-            print(f"Moving to {target_angle} degrees...")
-            time_to_move = target_angle * time_per_deg_tilt
-            move_camera(ptz, move_req, 0.0, speed)
-            time.sleep(time_to_move)
+            print(f"Moving from {current_angle}° to {target_angle}° (Delta: {delta_angle}°)...")
+            move_camera(ptz, move_req, 0.0, applied_tilt_speed)
+            time.sleep(time_to_move) 
             stop_camera(ptz, move_req)
+            
+            current_angle = target_angle 
             print("Done! Look at the camera. Is this a good default elevation?")
+        
             
         except KeyboardInterrupt:
             print("\nExiting calibration tool.")

@@ -51,20 +51,21 @@ RESPEAKER_DISABLE_HPF = True
 
 
 #Camera Physical Limits & Calibration
-MOVE_SPEED = 0.75
+MOVE_SPEED = 0.6
 MIN_ANGLE = -177.5              
 MAX_ANGLE = 177.5 
 PAN_RANGE_SOFTWARE = MAX_ANGLE - MIN_ANGLE
-PAN_TIME_END_TO_END = 26            
+PAN_TIME_END_TO_END = 21.17 # for speed of 0.6, measured with calibration tool            
 TIME_PER_DEGREE_PAN = PAN_TIME_END_TO_END / PAN_RANGE_SOFTWARE
 
 # Tilt Scanning settings
-DEFAULT_ELEVATION_ANGLE = 55
+DEFAULT_ELEVATION_ANGLE = 40
+TILT_CHECKPOINTS = [25.0, 35.0, 55.0] 
 
 MIN_TILT = 0.0
-MAX_TILT = 90.0
-TILT_RANGE_SOFTWARE = 90
-TILT_TIME_END_TO_END = 10
+MAX_TILT = 70.0
+TILT_RANGE_SOFTWARE = MAX_TILT - MIN_TILT
+TILT_TIME_END_TO_END = 3.76 # for speed of 0.6, measured with calibration tool
 TIME_PER_DEGREE_TILT = TILT_TIME_END_TO_END / TILT_RANGE_SOFTWARE
 
 # --- FSM Tactical Timeouts & Visual Tracking ---
