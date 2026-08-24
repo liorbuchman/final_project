@@ -1381,6 +1381,13 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     runtime.record_engine.stop()
+    if runtime.hardware_active:
+        # hardware_bridge.shutdown() blocks (it joins DroneSystemThread), so it
+        # runs in the default executor rather than inline - keeps the event
+        # loop spinning during the join, which is what lets its "dashboard"
+        # logger calls actually reach connected GUI clients via
+        # WebSocketLogHandler (call_soon_threadsafe needs a live loop).
+        await asyncio.get_event_loop().run_in_executor(None, hardware_bridge.shutdown)
     stop_jtop()
 
 

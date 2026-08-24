@@ -2,8 +2,9 @@
 import cv2
 import config
 import logging
-import time     
+import time
 import math
+import numpy as np
 import queue
 import threading
 from ultralytics import YOLO
@@ -92,6 +93,27 @@ class OpticalDetector:
         print("[Optical] Initializing YOLOv8 tensor weights...")
         self.model = YOLO(self.model_path)
         self.model.to(config.DEVICE)
+
+        # ultralytics defers building the real inference backend (AutoBackend)
+        # and fusing conv+bn layers - which needs its own CUDA/cuBLAS
+        # allocation - until the *first* .track()/.predict() call, not
+        # .to(device). Under GPU memory pressure that first call can fail
+        # with CUBLAS_STATUS_ALLOC_FAILED; forcing it here, during
+        # calibration, means that failure (if it happens) is visible and
+        # controlled instead of silently killing optical_master_loop
+        # mid-mission on the first real detection. Mirrors run_inference's
+        # own .track() call exactly, on a blank frame, so it's the same code
+        # path that would otherwise fail live.
+        print("[Optical] Warming up YOLO inference engine...")
+        warmup_frame = np.zeros((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8)
+        use_half = (config.DEVICE.type == 'cuda')
+        self.model.track(warmup_frame,
+                          stream=False,
+                          persist=True,
+                          tracker="bytetrack.yaml",
+                          half=use_half,
+                          conf=config.YOLO_LOW_CONF_THRESHOLD,
+                          verbose=False)
         print(f"[Optical] Vision pipeline hot on native execution target: {config.DEVICE}")
 
     def run_inference(self, frame):

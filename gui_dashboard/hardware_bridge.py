@@ -66,6 +66,7 @@ _latest_acoustic_confidence = 0.0
 DroneSystem = None  # set by activate() on success; live ComrandInBattle instance
 _config_module = None
 _activated = False
+_drone_thread: Optional[threading.Thread] = None  # the DroneSystemThread started by activate()
 
 # --- Rolling raw-audio buffer for the acoustic sample recorder ---
 # Always holds the last AUDIO_RING_MAX_S seconds of the single channel the
@@ -374,7 +375,7 @@ def activate(dashboard_handler=None) -> bool:
     main_system.py's own basicConfig(force=True) wipes it - see
     _patch_init_logging. Optional only so this module stays importable/
     testable without main.py's logging setup."""
-    global DroneSystem, _config_module, _activated
+    global DroneSystem, _config_module, _activated, _drone_thread
     if _activated:
         return True
 
@@ -404,11 +405,46 @@ def activate(dashboard_handler=None) -> bool:
 
     _config_module = jetson_config
     DroneSystem = main_system.ComrandInBattle()
-    threading.Thread(target= DroneSystem.initialize_system, daemon=True, name="DroneSystemThread").start()
+    _drone_thread = threading.Thread(target=DroneSystem.initialize_system, daemon=True, name="DroneSystemThread")
+    _drone_thread.start()
 
     _activated = True
     logger.info("Hardware bridge activated - ComrandInBattle running live")
     return True
+
+
+def shutdown(timeout: float = 3.0) -> None:
+    """Gracefully stops the live ComrandInBattle instead of leaving it to be
+    killed mid-loop when this process exits - DroneSystemThread is a daemon
+    thread, so it gets no chance to run its own cleanup otherwise.
+
+    Setting `running = False` is the exact same signal main_system.py's own
+    __main__ block sets on Ctrl+C: main_system.py's three loops
+    (acoustic_background_loop, tactical_fsm_loop, optical_master_loop) all
+    poll `while self.running`, so within one poll interval they unwind on
+    their own and run their existing, untouched cleanup - optical_master_loop
+    in particular stops the PTZ motors (track_target(0, 0)) and releases the
+    VideoCapture. Joining the thread makes this synchronous, so the caller
+    (main.py's on_shutdown) knows the hardware was actually stopped, not just
+    asked to stop, before the process exits.
+
+    Uses the "dashboard" logger (like every other function here) so shutdown
+    progress reaches both the log file and, via WebSocketLogHandler, any GUI
+    still connected - safe to call from a worker thread since emit() already
+    marshals the broadcast onto the event loop with call_soon_threadsafe."""
+    if DroneSystem is None:
+        return
+    logger.info("Hardware bridge shutdown requested - stopping ComrandInBattle...")
+    DroneSystem.running = False
+    if _drone_thread is not None:
+        _drone_thread.join(timeout=timeout)
+        if _drone_thread.is_alive():
+            logger.warning(
+                "ComrandInBattle did not stop within %.1fs - PTZ motors may not have received a stop command",
+                timeout,
+            )
+        else:
+            logger.info("ComrandInBattle stopped cleanly - motors halted, video capture released")
 
 
 def get_vision_fps() -> float:

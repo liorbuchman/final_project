@@ -333,9 +333,17 @@ class ComrandInBattle:
             if frame_fetched and frame is not None:
                 inference_frame  = frame
 
-                # Only run heavy YOLO inference if we are searching or tracking
+                # Only run heavy YOLO inference if we are searching or tracking.
+                # A failure here (e.g. a transient CUDA/GPU-memory error) must
+                # not take down this whole loop - that would silently kill the
+                # video feed for the rest of the process, with no supervisor
+                # to restart it. Falls back to the plain captured frame
+                # (no boxes/labels burned in) for this one iteration only.
                 if current_state in [SystemState.TRACKING, SystemState.ENGAGED]:
-                    inference_frame = self.video_processor.run_inference(inference_frame)
+                    try:
+                        inference_frame = self.video_processor.run_inference(inference_frame)
+                    except Exception as inference_err:
+                        logging.error(f"[Optical] run_inference failed on this frame, skipping: {inference_err}")
 
                 with self.data_lock:
                     self.visual_lock_acquired = self.video_processor.visual_lock
