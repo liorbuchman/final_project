@@ -146,6 +146,12 @@ function VideoFeed() {
   useEffect(() => {
     const controller = new AbortController();
     let cancelled = false;
+    // Diagnostics only (temporary) - one line per outcome, not per frame, so
+    // it's easy to tell "never receiving frames" apart from "receiving but
+    // failing to decode" apart from "decoding fine but not drawing" from the
+    // console alone.
+    let framesDrawn = 0;
+    let decodeFailures = 0;
 
     async function drainFrames(buf) {
       // Consumes as many complete JPEG parts as are currently buffered,
@@ -172,9 +178,15 @@ function VideoFeed() {
             canvas.getContext("2d").drawImage(bitmap, 0, 0);
           }
           bitmap.close();
+          framesDrawn++;
+          if (framesDrawn === 1 || framesDrawn % 60 === 0) {
+            console.log(`VideoFeed: drew frame #${framesDrawn} (${bitmap.width}x${bitmap.height}, ${jpegBytes.length}B), canvas=${!!canvas}`);
+          }
         } catch (e) {
-          // Malformed part (e.g. "--frame" happened to occur inside binary
-          // JPEG data) - drop this one frame and keep the stream going.
+          decodeFailures++;
+          if (decodeFailures === 1 || decodeFailures % 30 === 0) {
+            console.error(`VideoFeed: decode failed x${decodeFailures} (part was ${jpegBytes.length}B, first bytes: ${jpegBytes.slice(0, 8)})`, e);
+          }
         }
       }
     }
@@ -183,21 +195,21 @@ function VideoFeed() {
       while (!cancelled) {
         try {
           const resp = await fetch("/video_feed", { signal: controller.signal, cache: "no-store" });
+          console.log("VideoFeed: connected", resp.status, resp.headers.get("content-type"));
           if (!resp.body) throw new Error("no body");
           const reader = resp.body.getReader();
           let buf = new Uint8Array(0);
 
           while (!cancelled) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) { console.log("VideoFeed: stream ended (done=true)"); break; }
             const merged = new Uint8Array(buf.length + value.length);
             merged.set(buf, 0);
             merged.set(value, buf.length);
             buf = await drainFrames(merged);
           }
         } catch (e) {
-          // Network error, or the abort() from cleanup below - either way,
-          // fall through to the reconnect delay (skipped if we're cancelled).
+          if (!cancelled) console.error("VideoFeed: stream error", e);
         }
         if (cancelled) return;
         await new Promise(r => setTimeout(r, 1500));

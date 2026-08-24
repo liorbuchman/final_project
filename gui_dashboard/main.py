@@ -997,8 +997,15 @@ def jetson_metrics() -> dict:
     if _jtop_handle is not None:
         try:
             if _jtop_handle.ok():
+                # jtop.cpu["cpu"] is a list of per-core dicts in current
+                # jetson-stats versions (was a dict keyed by core index in
+                # older ones, hence the isinstance guard) - iterate it
+                # directly rather than treating its own values as indices.
+                cores = _jtop_handle.cpu["cpu"]
+                core_list = cores.values() if isinstance(cores, dict) else cores
+                usages = [c["user"] for c in core_list if isinstance(c, dict) and "user" in c]
                 return {
-                    "cpu": round(sum(_jtop_handle.cpu["cpu"][i]["user"] for i in _jtop_handle.cpu["cpu"]) / max(1, len(_jtop_handle.cpu["cpu"])), 1),
+                    "cpu": round(sum(usages) / max(1, len(usages)), 1),
                     "gpu": round(_jtop_handle.gpu.get("val", 0), 1),
                     "temp_c": round(_jtop_handle.temperature.get("CPU", {}).get("temp", 0), 1),
                 }
