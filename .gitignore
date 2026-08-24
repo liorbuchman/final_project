@@ -24,6 +24,7 @@ uav_vision/models/
 uav_acoustic/models/
 uav_acoustic/data/
 uav_vision/src/recorded_drones/
+usb_4_mic_array
 
 # System & Environment
 __pycache__/
@@ -38,10 +39,25 @@ drone_env/
 Thumbs.db
 
 # gui_dashboard runtime state
-gui_dashboard/config.json
+
 
 # gui_dashboard recorded training frames (already covered by recordings/ above,
 # listed explicitly too since these can grow large fast)
 gui_dashboard/recordings/frames_*/
 gui_dashboard/recordings/acoustic_*/
 gui_dashboard/recordings/*.jsonl
+gui_dashboard/config.json
+gui_dashboard/CLAUDE.md
+
+# Mic array and firmware
+usb_4_mic_array/
+6_channels_firmware.bin
+dfu.py
+
+# Claude and AI specific files
+.claude/
+gui_dashboard/CLAUDE.md
+gui_dashboard/SPEC.md
+
+# Config files
+gui_dashboard/config.json
