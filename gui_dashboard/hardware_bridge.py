@@ -114,20 +114,32 @@ def _patch_video_capture():
 
 def _patch_frame_capture_timing():
     """optical_master_loop's cap.read() (cv2.VideoCapture instance method) is
-    the actual GStreamer frame-fetch call. There's exactly one VideoCapture
-    instance anywhere in this codebase, so patching the class method globally
-    is safe and precise - purely a timing wrap, the real read() runs as-is."""
-    original_read = cv2.VideoCapture.read
+    the actual GStreamer frame-fetch call. cv2.VideoCapture is a C-extension
+    type with no instance __dict__, so `read` can't be monkey-patched on the
+    class (TypeError: immutable type) or on a specific instance (AttributeError:
+    read-only attribute) - there's simply nowhere on the real object to attach
+    a wrapped method. Instead, replace the cv2.VideoCapture *constructor*
+    (just a name in the cv2 module namespace, which is an ordinary mutable
+    object) with a thin proxy that forwards every call to a real
+    VideoCapture instance and times only read()."""
+    original_video_capture = cv2.VideoCapture
 
-    def timed_read(self, *args, **kwargs):
-        t0 = time.perf_counter()
-        result = original_read(self, *args, **kwargs)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        with _stage_lock:
-            _stage_timings["frame_capture_ms"] = elapsed_ms
-        return result
+    class _TimedVideoCapture:
+        def __init__(self, *args, **kwargs):
+            self._cap = original_video_capture(*args, **kwargs)
 
-    cv2.VideoCapture.read = timed_read
+        def read(self, *args, **kwargs):
+            t0 = time.perf_counter()
+            result = self._cap.read(*args, **kwargs)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            with _stage_lock:
+                _stage_timings["frame_capture_ms"] = elapsed_ms
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._cap, name)
+
+    cv2.VideoCapture = _TimedVideoCapture
 
 
 def _patch_acoustic_confidence(acoustic_detector_cls):
