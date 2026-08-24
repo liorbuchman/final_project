@@ -18,6 +18,7 @@ results/
 *.pth
 *.weights
 *.engine
+*.onnx
 *.trt
 uav_vision/models/
 uav_acoustic/models/

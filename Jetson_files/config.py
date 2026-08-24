@@ -13,7 +13,7 @@ RTSP_URL = "rtsp://admin:admin@192.168.1.90:554/live/ch0"
 CAMERA_IP = '192.168.1.90'
 CAMERA_USER = 'admin'
 CAMERA_PASS = 'admin'
-YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "best_v6.pt")
+YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "models", "best_v6.engine")
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 YOLO_LOW_CONF_THRESHOLD = 0.25
@@ -21,7 +21,7 @@ YOLO_HIGH_CONF_THRESHOLD = 0.5
 SAVE_LAST_FRAME_FLAG = False
 
 # --- Acoustic Settings ---
-AUDIO_MODEL_DIR = os.path.join(BASE_DIR, "uav_acoustic")
+AUDIO_MODEL_DIR = os.path.join(BASE_DIR, "uav_acoustic", "models")
 IDVENDOR = 0x2886
 IDPRODUCT = 0x0018
 AUDIO_CHANNEL = 0

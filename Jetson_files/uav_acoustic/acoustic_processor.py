@@ -98,24 +98,10 @@ class AcousticDetector:
         try:
             device = config.DEVICE
             self.model = SmallCNN(n_classes=2).to(device)
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            
-            # Multi-path safe weight resolution
-            potential_paths = [
-                os.path.join(current_dir, "best_model.pt"),
-                os.path.join(config.AUDIO_MODEL_DIR, "best_model.pt"),
-                os.path.join(os.getcwd(), "uav_acoustic", "best_model.pt"),
-                os.path.join(os.getcwd(), "best_model.pt")
-            ]
-            
-            model_path = None
-            for p in potential_paths:
-                if os.path.exists(p):
-                    model_path = p
-                    break
-                    
-            if model_path is None:
-                raise FileNotFoundError("best_model.pt not found in any standard directory.")
+            model_path = os.path.join(config.AUDIO_MODEL_DIR, "best_model.pt")
+
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Model file not found exactly at: {model_path}")
             
             checkpoint = torch.load(model_path, map_location=device, weights_only=False)
             self.model.load_state_dict(checkpoint["state_dict"])
