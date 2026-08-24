@@ -51,11 +51,26 @@
   .header-bar > * { flex-shrink: 0; white-space: nowrap; }
   .main-row { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: row; overflow: hidden; }
   .tactical-col { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-  .video-box { flex: 1 1 auto; min-height: 0; overflow: hidden; background: #000; display: flex; align-items: center; justify-content: center; }
-  .video-frame { position: relative; aspect-ratio: 16 / 9; max-width: 100%; max-height: 100%; background: #000; }
+  /* #0b0d10 (not pure black) so the letterbox margin around a narrower-than-
+     .video-box .video-frame reads as page background, not a second black
+     void merging into the video's own black - same intent as a normal video
+     player's letterbox bars. */
+  .video-box { flex: 1 1 auto; min-height: 0; overflow: hidden; background: #0b0d10; display: flex; align-items: center; justify-content: center; }
+  /* height: 100% (a definite size, from .video-box's own definite flex
+     height) lets aspect-ratio correctly derive width from it - giving
+     .video-frame itself a tight 16:9 box instead of stretching to fill all
+     of .video-box's (much wider) width. max-width covers the case where
+     .video-box is narrower than tall, so the derived width would overflow.
+     (A previous version of this rule tried aspect-ratio with NEITHER
+     dimension definite - only max-width/max-height - which resolves to 0x0
+     for a flex item whose only content is `position: absolute` and so
+     contributes nothing to auto content-sizing; confirmed via
+     canvas.getBoundingClientRect(). The fix here keeps one axis definite so
+     that edge case never applies.) */
+  .video-frame { position: relative; height: 100%; aspect-ratio: 16 / 9; max-width: 100%; background: #000; }
   .compass-strip { flex-shrink: 0; overflow: hidden; }
   .sidebar-col { width: 320px; flex-shrink: 0; min-height: 0; overflow-y: auto; }
-  .bottom-panel { flex-shrink: 0; height: 190px; overflow: hidden; display: flex; flex-direction: column; }
+  .bottom-panel { flex-shrink: 0; height: 160px; overflow: hidden; display: flex; flex-direction: column; }
   .tab-scroll-area { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
   .chart-mini { height: 90px; overflow: hidden; display: flex; flex-direction: column; }
   .chart-mini canvas { flex: 1 1 auto; min-height: 0; width: 100%; }
@@ -172,16 +187,19 @@ function VideoFeed() {
         try {
           const bitmap = await createImageBitmap(new Blob([jpegBytes], { type: "image/jpeg" }));
           const canvas = canvasRef.current;
+          framesDrawn++;
           if (canvas && !cancelled) {
             if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
             if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
             canvas.getContext("2d").drawImage(bitmap, 0, 0);
+            if (framesDrawn === 1 || framesDrawn % 60 === 0) {
+              const box = canvas.getBoundingClientRect();
+              console.log(`VideoFeed: drew frame #${framesDrawn} bitmap=${bitmap.width}x${bitmap.height} canvas.attr=${canvas.width}x${canvas.height} canvas.cssBox=${box.width.toFixed(0)}x${box.height.toFixed(0)} at (${box.left.toFixed(0)},${box.top.toFixed(0)})`);
+            }
+          } else if (framesDrawn === 1) {
+            console.log(`VideoFeed: decoded frame #1 (${bitmap.width}x${bitmap.height}) but canvasRef.current is`, canvas);
           }
           bitmap.close();
-          framesDrawn++;
-          if (framesDrawn === 1 || framesDrawn % 60 === 0) {
-            console.log(`VideoFeed: drew frame #${framesDrawn} (${bitmap.width}x${bitmap.height}, ${jpegBytes.length}B), canvas=${!!canvas}`);
-          }
         } catch (e) {
           decodeFailures++;
           if (decodeFailures === 1 || decodeFailures % 30 === 0) {
@@ -263,6 +281,7 @@ function App() {
   const [acousticMaxSamples, setAcousticMaxSamples] = useState(300);
   const [acousticWindowInput, setAcousticWindowInput] = useState("2.0");
   const [acousticMaxInput, setAcousticMaxInput] = useState("300");
+  const [guiRecording, setGuiRecording] = useState(false);
 
   const wsRef = useRef(null);
   const backoffRef = useRef(1000);
@@ -270,6 +289,9 @@ function App() {
   const spectroCanvasRef = useRef(null);
   const waveChartRef = useRef(null);
   const waveCanvasRef = useRef(null);
+  const guiRecorderRef = useRef(null);
+  const guiChunksRef = useRef([]);
+  const guiStreamRef = useRef(null);
 
   function refreshRecordings() {
     fetch("/recordings").then(r => r.json()).then(d => setAvailableRecordings(d.files || [])).catch(() => {});
@@ -414,6 +436,85 @@ function App() {
     } else {
       sendCommand({ command: "set_frame_recording", enabled: false });
     }
+  }
+
+  // Records the whole dashboard (not just the video panel) as a real video
+  // file, entirely client-side via getDisplayMedia + MediaRecorder - the
+  // Jetson is never involved, so this doesn't touch its memory/storage at
+  // all. Whether the recording lands on the Jetson or elsewhere just follows
+  // wherever this browser tab is actually running (per SPEC.md, that's meant
+  // to be a separate laptop viewing the dashboard over the network, not a
+  // browser on the Jetson itself).
+  async function startGuiRecording() {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 15 }, audio: false });
+      guiStreamRef.current = stream;
+      guiChunksRef.current = [];
+
+      const mimeCandidates = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+      const mimeType = mimeCandidates.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      guiRecorderRef.current = recorder;
+
+      recorder.ondataavailable = e => { if (e.data && e.data.size > 0) guiChunksRef.current.push(e.data); };
+      recorder.onstop = () => { saveGuiRecording(); };
+      // Covers the user stopping the share via the browser's own "Stop
+      // sharing" bar instead of our button.
+      stream.getVideoTracks()[0].onended = () => stopGuiRecording();
+
+      recorder.start();
+      setGuiRecording(true);
+    } catch (e) {
+      // Picker cancelled, or permission denied - nothing to recover from,
+      // just stay in the not-recording state.
+    }
+  }
+
+  function stopGuiRecording() {
+    const recorder = guiRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+    const stream = guiStreamRef.current;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    guiStreamRef.current = null;
+    setGuiRecording(false);
+  }
+
+  async function saveGuiRecording() {
+    const blob = new Blob(guiChunksRef.current, { type: "video/webm" });
+    guiChunksRef.current = [];
+    if (blob.size === 0) return;
+    const filename = `dashboard-recording-${new Date().toISOString().replace(/[:.]/g, "-")}.webm`;
+
+    // File System Access API (Chrome/Edge) lets the viewer pick exactly
+    // where to save - e.g. straight to a mounted external drive - instead of
+    // always landing in the default Downloads folder. Firefox doesn't
+    // implement this yet, hence the plain-download fallback below.
+    if (window.showSaveFilePicker) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: filename,
+          types: [{ description: "WebM video", accept: { "video/webm": [".webm"] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        return;
+      } catch (e) {
+        // Save dialog cancelled, or the API errored - fall through so the
+        // recording isn't lost, it just goes to the default download path.
+      }
+    }
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function toggleGuiRecording() {
+    if (guiRecording) stopGuiRecording(); else startGuiRecording();
   }
 
   function toggleAcousticRecording() {
@@ -601,11 +702,20 @@ function App() {
 
           <div className="w-px self-stretch bg-gray-700 mx-1"></div>
 
+          <button onClick={toggleGuiRecording}
+            title="Record the whole dashboard as a video file (screen/tab capture) - saved to your own device, not the Jetson"
+            className={`px-3 py-1.5 rounded text-sm font-semibold flex items-center gap-1.5 ${guiRecording ? "bg-red-700" : "bg-gray-700"}`}>
+            <span className={`w-2 h-2 rounded-full inline-block ${guiRecording ? "bg-red-300 animate-pulse" : "bg-gray-400"}`}></span>
+            {guiRecording ? "Recording GUI…" : "Record GUI"}
+          </button>
+
+          <div className="w-px self-stretch bg-gray-700 mx-1"></div>
+
           <button disabled={!connected} onClick={toggleRecording}
-            title="Capture live telemetry + spectrogram to a session file for later replay"
+            title="Capture live telemetry + spectrogram (not video) to a session file for later replay"
             className={`px-3 py-1.5 rounded text-sm font-semibold flex items-center gap-1.5 disabled:opacity-40 ${recording ? "bg-red-700" : "bg-gray-700"}`}>
             <span className={`w-2 h-2 rounded-full inline-block ${recording ? "bg-red-300 animate-pulse" : "bg-gray-400"}`}></span>
-            {recording ? "Recording…" : "Record Session"}
+            {recording ? "Recording Telemetry…" : "Record Telemetry"}
           </button>
 
           <div className="w-px self-stretch bg-gray-700 mx-1"></div>
@@ -670,11 +780,10 @@ function App() {
 
           {/* Video: outer .video-box is sized by flex-grow so it never dictates the
               tactical column's height from stream content - no reflow, no flicker.
-              The inner .video-frame has no explicit width/height, only aspect-ratio
-              + max-width/max-height - that lets the browser derive BOTH dimensions
-              jointly (the true "shrink to fit, keep the 16:9 = 1280x720 ratio"
-              behavior) instead of computing height from a fixed width and then just
-              clipping it, which silently distorted the box below its max-height. */}
+              The inner .video-frame just fills .video-box completely (see its CSS
+              rule for why it doesn't try to size itself to the 16:9 ratio directly
+              anymore) - VideoFeed's own <canvas> carries object-fit: contain, which
+              does the actual "shrink to fit, keep ratio, no distortion" job. */}
           <div className={"video-box w-full " + (debugMode ? "rounded-lg" : "")}>
             <div className="video-frame">
               <VideoFeed />
@@ -700,7 +809,7 @@ function App() {
               for space - always live in both hardware and simulated mode (simulated
               values are explicitly fabricated for demo purposes, see telemetry_loop
               in main.py). */}
-          <div className={"compass-strip w-full bg-panel p-2 " + (debugMode ? "rounded-lg" : "")}>
+          <div className={"compass-strip w-full bg-panel p-1.5 " + (debugMode ? "rounded-lg" : "")}>
             <CompassStrip telemetry={telemetry} panMinDeg={panMinDeg} panMaxDeg={panMaxDeg} />
           </div>
         </div>
@@ -943,7 +1052,7 @@ function CompassStrip({ telemetry, panMinDeg, panMaxDeg }) {
         <span>Camera Bearing vs Acoustic DOA</span>
         <span className="tabular-nums">{aligned ? "ALIGNED" : `${fmt(diff, 0)}° off`}</span>
       </div>
-      <div className="relative h-10 bg-black rounded overflow-hidden">
+      <div className="relative h-8 bg-black rounded overflow-hidden">
         {/* Camera optical FOV (+/-45deg), for context - independent of the wider mechanical pan range */}
         {(-45 >= lo && -45 <= hi) && <div className="absolute inset-y-0 border-l border-dashed border-blue-500/40" style={{ left: `${toPct(-45)}%` }}></div>}
         {(45 >= lo && 45 <= hi) && <div className="absolute inset-y-0 border-l border-dashed border-blue-500/40" style={{ left: `${toPct(45)}%` }}></div>}
