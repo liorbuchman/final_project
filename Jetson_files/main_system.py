@@ -81,6 +81,19 @@ class ComrandInBattle:
         """Initializes hardware contexts and spawns concurrent subsystem threads."""
         self.init_logging()
 
+        # Open the GStreamer/NVDEC video pipeline FIRST, before either CUDA
+        # model below claims GPU memory. On the Jetson, the hardware decoder's
+        # NVMM buffer pool is separate from general CUDA memory and can fail
+        # to allocate (NvMap error 12 / "Unable to allocate HW buffer") once
+        # PyTorch has already reserved a chunk - confirmed by isolating
+        # gst-launch (works alone) vs. this process (fails after YOLO/CNN load).
+        try:
+            pipeline_string = config.get_gstreamer_pipeline()
+            self.video_processor.cap = cv2.VideoCapture(pipeline_string, cv2.CAP_GSTREAMER)
+        except Exception as video_pipeline_err:
+            logging.error(f"GStreamer pipeline open failure: {video_pipeline_err}")
+            self.video_processor.cap = None
+
         # Load acoustic model
         try:
             self.audio_processor.load_model()
@@ -282,14 +295,13 @@ class ComrandInBattle:
     def optical_master_loop(self):
         """High-throughput video capture loop running on native execution thread."""
         import numpy as np
-        
-        pipeline_string = config.get_gstreamer_pipeline()
-        cap = cv2.VideoCapture(pipeline_string, cv2.CAP_GSTREAMER)
+
+        cap = self.video_processor.cap
 
         with self.data_lock:
             is_cam_driver_ok = (self.optical_hw_status != "UNAVAILABLE")
 
-        if not cap.isOpened() or not is_cam_driver_ok:
+        if cap is None or not cap.isOpened() or not is_cam_driver_ok:
             with self.data_lock:
                 self.optical_hw_status = "UNAVAILABLE"
         else:
@@ -366,7 +378,8 @@ class ComrandInBattle:
                 self.video_processor.track_target(0, 0, wait=True)
             except Exception:
                 pass
-        cap.release()
+        if cap is not None:
+            cap.release()
         try:
             cv2.destroyAllWindows()
         except Exception:

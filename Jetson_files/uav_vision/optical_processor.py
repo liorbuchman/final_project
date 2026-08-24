@@ -15,6 +15,8 @@ class OpticalDetector:
     def __init__(self):
         self.model_path = config.YOLO_MODEL_PATH
         self.model = None
+        self.cap = None  # cv2.VideoCapture handle; opened by main_system.initialize_system()
+                          # before any CUDA model load - see optical_master_loop()
         self.ptz, self.move_req, self.token, self.ptz_url = [None]*4
         self.high_conf_achieved = False
         self.visual_lock = False
