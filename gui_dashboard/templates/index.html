@@ -1,3 +1,4 @@
+<!DOCTYPE html>
 <title>UAV Multi-Modal Detection Dashboard</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" crossorigin></script>
@@ -103,6 +104,51 @@ function beep() {
 function fmt(n, d = 1) {
   if (n === null || n === undefined || Number.isNaN(n)) return "N/A";
   return Number(n).toFixed(d);
+}
+
+// The /video_feed multipart/x-mixed-replace stream's underlying network
+// request has been observed (devtools: Initiator "img", NS_BINDING_ABORTED)
+// getting silently aborted right after this <img> first mounts, while a
+// second, unrelated request to the same URL keeps flowing fine - leaving the
+// visible <img> permanently blank with nothing the JS side can reliably catch
+// (onerror doesn't fire consistently for a stream cut off mid-flight after
+// headers were already accepted). Rather than depend on onError alone, this
+// also refreshes on a fixed interval so a stuck connection recovers within
+// one cycle instead of staying dead for the rest of the session.
+//
+// The retry uses `key={nonce}` to force React to unmount the old <img> DOM
+// node and mount a genuinely new one, rather than just reassigning `src` on
+// the same element - merely changing `src` relies on the browser reliably
+// aborting the previous in-flight request on its own, which is exactly the
+// behavior that's already unreliable for this multipart stream (that's the
+// bug this component works around in the first place). An actual unmount is
+// the one thing every browser is guaranteed to treat as "stop this request" -
+// without it, a retry could leave the old connection dangling forever,
+// leaking one open server-side connection per retry for as long as the tab
+// stays open (this is suspected to have been the cause of a stuck/very slow
+// server shutdown - many leaked /video_feed connections all needing to be
+// force-cancelled at once).
+function VideoFeed() {
+  const [nonce, setNonce] = useState(0);
+  const retryTimer = useRef(null);
+
+  useEffect(() => {
+    const id = setInterval(() => setNonce(n => n + 1), 30000);
+    return () => clearInterval(id);
+  }, []);
+
+  function handleError() {
+    if (retryTimer.current) return;
+    retryTimer.current = setTimeout(() => {
+      retryTimer.current = null;
+      setNonce(n => n + 1);
+    }, 1000);
+  }
+
+  return (
+    <img key={nonce} src={`/video_feed?r=${nonce}`} onError={handleError}
+      className="absolute inset-0 w-full h-full object-contain bg-black" />
+  );
 }
 
 function App() {
@@ -554,7 +600,7 @@ function App() {
               clipping it, which silently distorted the box below its max-height. */}
           <div className={"video-box w-full " + (debugMode ? "rounded-lg" : "")}>
             <div className="video-frame">
-              <img src="/video_feed" className="absolute inset-0 w-full h-full object-contain bg-black" />
+              <VideoFeed />
               {!camera.connected && (
                 <div className="absolute inset-0 flex items-center justify-center text-gray-500 font-mono text-2xl bg-black">
                   NO SIGNAL

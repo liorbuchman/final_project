@@ -32,6 +32,7 @@ changes to telemetry_loop, video_encode_loop, or the WebSocket handlers.
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import threading
 import time
@@ -75,6 +76,7 @@ _drone_thread: Optional[threading.Thread] = None  # the DroneSystemThread starte
 AUDIO_RING_MAX_S = 5.0
 _audio_lock = threading.Lock()
 _audio_ring: Optional[np.ndarray] = None
+_latest_audio_db: Optional[float] = None  # dBFS of the newest chunk, set in _update_audio_ring
 
 # --- Per-pipeline-stage latency, for the GUI's "Pipeline Latency" tab ---
 # Each value is a plain time.perf_counter() delta around a call the untouched
@@ -199,7 +201,7 @@ def _update_audio_ring(raw_buffer):
     its last step_samples rows. Append just that into our own longer,
     independent ring so a 1-5s clip can be sliced out later regardless of the
     model's own (fixed, shorter) inference window."""
-    global _audio_ring
+    global _audio_ring, _latest_audio_db
     if _config_module is None:
         return
     channel = getattr(_config_module, "AUDIO_CHANNEL", 0)
@@ -212,6 +214,16 @@ def _update_audio_ring(raw_buffer):
     except Exception:
         return
 
+    # dBFS of this newest chunk, for the GUI's "Mic Array" meter - same slice
+    # this function already extracts, just a second cheap reduction over it.
+    # RMS floored at the amplitude equal to -90 dBFS instead of 0, so true
+    # digital silence renders as a floor value instead of -inf/NaN.
+    if len(newest):
+        rms = float(np.sqrt(np.mean((newest.astype(np.float32) / 32768.0) ** 2)))
+        MIN_RMS_FOR_MINUS_90_DBFS = 10 ** (-90.0 / 20.0)
+        with _state_lock:
+            _latest_audio_db = 20.0 * math.log10(max(rms, MIN_RMS_FOR_MINUS_90_DBFS))
+
     ring_len = int(AUDIO_RING_MAX_S * sample_rate)
     with _audio_lock:
         if _audio_ring is None or len(_audio_ring) != ring_len:
@@ -219,6 +231,13 @@ def _update_audio_ring(raw_buffer):
         n = min(len(newest), ring_len)
         _audio_ring = np.roll(_audio_ring, -n)
         _audio_ring[-n:] = newest[-n:]
+
+
+def get_audio_db() -> Optional[float]:
+    """dBFS of the most recent audio chunk (see _update_audio_ring). None
+    until the first chunk has flowed through process_audio_buffer."""
+    with _state_lock:
+        return _latest_audio_db
 
 
 def get_audio_window(seconds: float) -> Optional[np.ndarray]:
@@ -597,10 +616,11 @@ class HardwareAudioPipeline:
             doa = DroneSystem.acoustic_azimuth
         conf = round(_latest_acoustic_confidence, 3)
         spec = get_latest_spectrogram_uint8()
+        db = get_audio_db()
         return self._AudioResult(
             confidence=conf,
             doa_deg=round(doa, 1),
-            db=None,
+            db=round(db, 1) if db is not None else None,
             waveform=get_waveform_preview(),
             spectrogram=spec if spec is not None else np.zeros((SPEC_ROWS, SPEC_COLS), dtype=np.uint8),
             sensor_ts=time.time(),

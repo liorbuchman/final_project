@@ -42,6 +42,15 @@ try:
     HAS_JTOP = True
 except ImportError:
     HAS_JTOP = False
+    # start_jtop() silently no-ops when this is False - log it once here so a
+    # missing GPU%/temp reading in the GUI is traceable to "jtop isn't
+    # installed" instead of looking like a silent runtime failure. Fix:
+    # `pip install jetson-stats` in this venv, and make sure the jtop.service
+    # systemd daemon is running on the Jetson (`sudo systemctl status jtop`).
+    logging.getLogger("dashboard").warning(
+        "jtop package not installed - GPU%/temp will show N/A. Install with "
+        "'pip install jetson-stats' and ensure jtop.service is running."
+    )
 
 # Single persistent jtop session for the whole process lifetime (opened once in
 # on_startup, closed once in on_shutdown) - see start_jtop()/jetson_metrics()
@@ -1186,6 +1195,7 @@ async def telemetry_loop():
                 "ts": now,
                 "state": state,
                 "mode": runtime.mode,
+                "hardware": runtime.hardware_active,
                 "sim": runtime.mode == "replay" or now < runtime.sim_badge_until,
                 "camera": {"connected": bool(active and runtime.vision.connected), "fps": runtime.vision.fps},
                 "audio": {"active": bool(active and runtime.audio.active), "db": audio_result.db if audio_result else None},
@@ -1591,4 +1601,11 @@ async def ws_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    # timeout_graceful_shutdown: uvicorn's default graceful shutdown waits
+    # indefinitely for every open connection to close on the client's own
+    # initiative - and /video_feed (an infinite MJPEG generator) and /ws (a
+    # long-lived WebSocket) never do that on their own. A browser tab left
+    # open on the dashboard would otherwise make Ctrl+C hang forever, before
+    # on_shutdown() (and hardware_bridge.shutdown()'s motor stop) ever runs.
+    # After 5s uvicorn force-closes remaining connections and proceeds.
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, timeout_graceful_shutdown=5)
