@@ -30,6 +30,11 @@ class ComrandInBattle:
         self.state = SystemState.CALIBRATING
         self.running = True
         self.state_timestamp = time.time()
+        # Timestamp of the most recent entry into TRACKING (from SCANNING or
+        # from ENGAGED on lock loss) - used to hold position for a short grace
+        # period before committing to a full acoustic re-search, instead of
+        # reacting to the very first post-lock-loss tick.
+        self.tracking_entered_at = time.time()
         
         # Thread synchronization primitive for cross-sensor data sharing
         self.data_lock = threading.Lock()
@@ -245,6 +250,7 @@ class ComrandInBattle:
                     with self.data_lock:
                         self.state = SystemState.TRACKING
                         self.state_timestamp = curr_time
+                    self.tracking_entered_at = curr_time
 
             elif current_state == SystemState.TRACKING:
                 # 1. Target found visually -> ENGAGE
@@ -255,16 +261,25 @@ class ComrandInBattle:
                     last_seen_visual_time = curr_time
                     if cam_status == "ONLINE":
                         self.video_processor.track_target(0, 0) # Stop scan motors
-                        
+
                 # 2. Moving camera to search for target
                 elif audio_alert:
-                    if cam_status == "ONLINE" and hasattr(self.video_processor, 'handle_acoustic_search'):
+                    time_in_tracking = curr_time - self.tracking_entered_at
+                    if time_in_tracking < config.RE_SEARCH_GRACE_PERIOD:
+                        # Grace period: hold position instead of immediately
+                        # committing to a full blocking macro-scan - gives vision
+                        # a brief window to reacquire on its own after a momentary
+                        # dropout, and avoids reacting to a single noisy acoustic
+                        # trigger the instant lock is lost.
+                        if cam_status == "ONLINE":
+                            self.video_processor.track_target(0, 0)
+                    elif cam_status == "ONLINE" and hasattr(self.video_processor, 'handle_acoustic_search'):
                         # This function handles pan and tilt sweep. Blocks until done or drone is found.
                         self.video_processor.handle_acoustic_search(target_azimuth)
-                    # Reset timeout only AFTER movement/scan is complete
-                    with self.data_lock:
-                        self.state_timestamp = time.time() 
-                        
+                        # Reset timeout only AFTER movement/scan is complete
+                        with self.data_lock:
+                            self.state_timestamp = time.time()
+
                 # 3. Timeout - Target lost, revert to scan
                 elif curr_time - self.state_timestamp > config.TARGET_LOST_TIMEOUT:
                     logging.info("[FSM] Search window expired. Returning to SCANNING.")
@@ -287,6 +302,7 @@ class ComrandInBattle:
                         with self.data_lock:
                             self.state = SystemState.TRACKING
                             self.state_timestamp = curr_time
+                        self.tracking_entered_at = curr_time
                         if cam_status == "ONLINE":
                             self.video_processor.track_target(0, 0)
 

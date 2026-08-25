@@ -26,6 +26,8 @@ IDVENDOR = 0x2886
 IDPRODUCT = 0x0018
 AUDIO_CHANNEL = 0
 AUDIO_CLASSIFICATION_THRESHOLD = 0.65
+AUDIO_TRIGGER_ON_CONFIRM_COUNT = 2  # consecutive buffers above threshold required to raise is_triggered (~0.4s at STEP_SECS)
+AUDIO_TRIGGER_OFF_CONFIRM_COUNT = 4  # consecutive buffers below threshold required to clear is_triggered (~0.8s at STEP_SECS)
 #fft parameters
 SAMPLE_RATE = 16000
 MEL_HOP_LENGTH = 256
@@ -60,7 +62,7 @@ TIME_PER_DEGREE_PAN = PAN_TIME_END_TO_END / PAN_RANGE_SOFTWARE
 
 # Tilt Scanning settings
 DEFAULT_ELEVATION_ANGLE = 40
-TILT_CHECKPOINTS = [15.0, 35.0, 55.0] 
+TILT_CHECKPOINTS = [55.0, 15.0, DEFAULT_ELEVATION_ANGLE]
 
 MIN_TILT = 0.0
 MAX_TILT = 70.0
@@ -71,10 +73,11 @@ TIME_PER_DEGREE_TILT = TILT_TIME_END_TO_END / TILT_RANGE_SOFTWARE
 # --- FSM Tactical Timeouts & Visual Tracking ---
 TARGET_LOST_TIMEOUT = 4
 VISUAL_LOCK_COOLDOWN = 1.5
+RE_SEARCH_GRACE_PERIOD = 1.0  # seconds to hold position after entering TRACKING before a full acoustic macro-scan starts
 KP_PAN = 0.0015
-KP_TILT = -0.0015
+KP_TILT = -0.0010
 KD_PAN = 0.0005
-KD_TILT = 0.0005
+KD_TILT = 0.0001
 TILT_DIRECTION_INVERSION = -1.0 # Inverts tilt axis for upside-down ceiling mounted PTZ
 
 # --- Hardware-Accelerated GStreamer Pipeline ---

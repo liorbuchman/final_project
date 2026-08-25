@@ -37,6 +37,12 @@ class AcousticDetector:
         self.outlier_streak_count = 0
         self.candidate_azimuth = 0.0
 
+        # Debounce streaks for is_triggered - requires several consecutive
+        # buffers on the same side of the threshold before flipping state, so
+        # a single noisy CNN frame can't flicker is_triggered on/off.
+        self.trigger_on_streak = 0
+        self.trigger_off_streak = 0
+
         # Exact DSP matching parameters from config (Single Source of Truth)
         self.sr = config.SAMPLE_RATE
         self.n_mels = config.MEL_N_MELS
@@ -153,6 +159,8 @@ class AcousticDetector:
                     logger.info(f"EVENT END - Energy below threshold (RMS: {rms_energy:.4f})")
                 self.is_triggered = False
                 self.lock_initialized = False
+                self.trigger_on_streak = 0
+                self.trigger_off_streak = 0
                 if self.leds:
                     self.set_led_color(0x001100) # Soft Green
                 return 0.0
@@ -180,25 +188,38 @@ class AcousticDetector:
         calculated_azimuth = self.read_hardware_doa_angle()
 
         # Step 3: Threshold and System lock pipeline management
+        # Debounced: a streak of several consecutive buffers on the same side
+        # of the threshold is required before is_triggered actually flips, so
+        # a single noisy CNN frame can't flicker the FSM's audio_alert signal
+        # (see EVENT START/END logs previously firing under a second apart).
+        on_confirm = getattr(config, 'AUDIO_TRIGGER_ON_CONFIRM_COUNT', 2)
+        off_confirm = getattr(config, 'AUDIO_TRIGGER_OFF_CONFIRM_COUNT', 4)
+
         if prediction_score > config.AUDIO_CLASSIFICATION_THRESHOLD:
-            if not self.is_triggered:
+            self.trigger_on_streak += 1
+            self.trigger_off_streak = 0
+
+            if not self.is_triggered and self.trigger_on_streak >= on_confirm:
                 logger.warning(f"EVENT START - Target detected. Initial Confidence: {prediction_score:.4f}")
                 self.lock_initialized = False # Force lock reset to capture new position on event start
-                
-            self.is_triggered = True
-            self.current_azimuth = self.apply_azimuth_smoothing(calculated_azimuth)
-            
-            logger.warning(f"DRONE HARDWARE TRACKING - Conf: {prediction_score:.4f} | Hardware Azimuth: {self.current_azimuth:.1f}°")
-            if self.leds:
-                self.set_led_color(0xFF0000) # Bright Red
-        else:
+                self.is_triggered = True
+                if self.leds:
+                    self.set_led_color(0xFF0000) # Bright Red
+
             if self.is_triggered:
+                self.current_azimuth = self.apply_azimuth_smoothing(calculated_azimuth)
+                logger.warning(f"DRONE HARDWARE TRACKING - Conf: {prediction_score:.4f} | Hardware Azimuth: {self.current_azimuth:.1f}°")
+        else:
+            self.trigger_off_streak += 1
+            self.trigger_on_streak = 0
+
+            if self.is_triggered and self.trigger_off_streak >= off_confirm:
                 logger.info("EVENT END - Target tracking lost or cleared.")
-            self.is_triggered = False
-            self.lock_initialized = False
-            if self.leds:
-                 self.set_led_color(0x001100) # Soft Green
-                
+                self.is_triggered = False
+                self.lock_initialized = False
+                if self.leds:
+                    self.set_led_color(0x001100) # Soft Green
+
         return prediction_score
 
     def apply_azimuth_smoothing(self, raw_azimuth):

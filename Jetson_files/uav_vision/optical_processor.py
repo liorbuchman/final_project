@@ -38,6 +38,11 @@ class OpticalDetector:
         
         self.current_camera_pan = 0.0
         self.current_tilt = config.DEFAULT_ELEVATION_ANGLE
+        # Speed last commanded by execute_visual_closed_loop; used to dead-reckon
+        # current_camera_pan/current_tilt while closed-loop visual tracking is
+        # driving the motors (see _integrate_ptz_motion).
+        self.prev_pan_speed = 0.0
+        self.prev_tilt_speed = 0.0
 
     def auto_calibrate_and_home(self):
         """
@@ -92,7 +97,12 @@ class OpticalDetector:
         
         print("[Optical] Initializing YOLOv8 tensor weights...")
         self.model = YOLO(self.model_path)
-        self.model.to(config.DEVICE)
+        if str(self.model_path).endswith('.pt'):
+            # .to(device) is only valid for native PyTorch (.pt) models.
+            # Exported formats (TensorRT .engine, ONNX, ...) are bound to a
+            # device/precision at export time; device is passed per-call to
+            # track()/predict() instead (see run_inference and the warmup below).
+            self.model.to(config.DEVICE)
 
         # ultralytics defers building the real inference backend (AutoBackend)
         # and fusing conv+bn layers - which needs its own CUDA/cuBLAS
@@ -113,6 +123,7 @@ class OpticalDetector:
                           tracker="bytetrack.yaml",
                           half=use_half,
                           conf=config.YOLO_LOW_CONF_THRESHOLD,
+                          device=config.DEVICE,
                           verbose=False)
         print(f"[Optical] Vision pipeline hot on native execution target: {config.DEVICE}")
 
@@ -122,12 +133,13 @@ class OpticalDetector:
             #logger.info(f"[DEBUG] Frame shape before YOLO: {frame.shape}")
             cv2.imwrite("what_yolo_actually_sees.jpg", frame)
         use_half = (config.DEVICE.type == 'cuda')
-        results = self.model.track(frame, 
-                                   stream=False, 
-                                   persist=True, 
-                                   tracker="bytetrack.yaml", 
-                                   half=use_half, 
-                                   conf=config.YOLO_LOW_CONF_THRESHOLD, 
+        results = self.model.track(frame,
+                                   stream=False,
+                                   persist=True,
+                                   tracker="bytetrack.yaml",
+                                   half=use_half,
+                                   conf=config.YOLO_LOW_CONF_THRESHOLD,
+                                   device=config.DEVICE,
                                    verbose=False)
         detected_this_frame = False
         
@@ -203,27 +215,53 @@ class OpticalDetector:
         if wait:
             time.sleep(0.15)
 
+    def _integrate_ptz_motion(self, dt):
+        """
+        Dead-reckons current_camera_pan/current_tilt forward by the speed that
+        was actually commanded during the last dt seconds. Mirrors the same
+        MOVE_SPEED-referenced calibration (TIME_PER_DEGREE_PAN/TILT) that
+        handle_acoustic_search already uses for its open-loop moves, just
+        generalized to the continuously-variable speed the PD controller in
+        execute_visual_closed_loop produces - so current_camera_pan/current_tilt
+        stay accurate even while closed-loop visual tracking is driving the
+        motors (previously only the open-loop scan updated them, so ENGAGED
+        tracking silently desynced the software's belief from the physical
+        camera position).
+        """
+        pan_delta = (self.prev_pan_speed / config.MOVE_SPEED) * dt / config.TIME_PER_DEGREE_PAN
+        tilt_delta = ((self.prev_tilt_speed / config.MOVE_SPEED) * dt / config.TIME_PER_DEGREE_TILT
+                       * config.TILT_DIRECTION_INVERSION)
+
+        self.current_camera_pan = max(config.MIN_ANGLE, min(config.MAX_ANGLE,
+                                       self.current_camera_pan + pan_delta))
+        self.current_tilt = max(config.MIN_TILT, min(config.MAX_TILT,
+                                 self.current_tilt + tilt_delta))
+
     def execute_visual_closed_loop(self):
         """Phase 2: Visual Tracking - PD Controller with Time Delta (dt)"""
-        if self.ptz is None: 
+        if self.ptz is None:
             return
+
+        current_time = time.time()
+        dt = current_time - getattr(self, 'prev_time', current_time - 0.1)
+        if dt <= 0: dt = 0.001
+        self.prev_time = current_time
+
+        # Account for the motion the previously-commanded speed produced over
+        # this tick before deciding on a new one.
+        self._integrate_ptz_motion(dt)
 
         if not self.visual_lock:
             self.track_target(0.0, 0.0)
-            self.prev_error_x = 0.0 
+            self.prev_error_x = 0.0
             self.prev_error_y = 0.0
-            self.prev_time = time.time() 
+            self.prev_pan_speed = 0.0
+            self.prev_tilt_speed = 0.0
             return
 
         with self.error_lock:
             current_error_x = self.error_x
             current_error_y = self.error_y
-        
-        
-        current_time = time.time()
-        dt = current_time - getattr(self, 'prev_time', current_time - 0.1)
-        if dt <= 0: dt = 0.001 
-        self.prev_time = current_time
 
         deadzone_x = config.FRAME_WIDTH * 0.10
         deadzone_y = config.FRAME_HEIGHT * 0.10
@@ -256,6 +294,8 @@ class OpticalDetector:
 
         self.prev_error_x = current_error_x
         self.prev_error_y = current_error_y
+        self.prev_pan_speed = pan_speed
+        self.prev_tilt_speed = tilt_speed
 
         self.track_target(pan_speed, tilt_speed)
 
