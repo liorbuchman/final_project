@@ -13,7 +13,7 @@ RTSP_URL = "rtsp://admin:admin@192.168.1.90:554/live/ch0"
 CAMERA_IP = '192.168.1.90'
 CAMERA_USER = 'admin'
 CAMERA_PASS = 'admin'
-YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "models", "best_v6.engine")
+YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "models", "best_v6.pt")
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 YOLO_LOW_CONF_THRESHOLD = 0.25
@@ -52,15 +52,15 @@ RESPEAKER_DISABLE_HPF = True
 
 #Camera Physical Limits & Calibration
 MOVE_SPEED = 0.6
-MIN_ANGLE = -177.5              
-MAX_ANGLE = 177.5 
+MIN_ANGLE = -175              
+MAX_ANGLE = 175 
 PAN_RANGE_SOFTWARE = MAX_ANGLE - MIN_ANGLE
 PAN_TIME_END_TO_END = 21.17 # for speed of 0.6, measured with calibration tool            
 TIME_PER_DEGREE_PAN = PAN_TIME_END_TO_END / PAN_RANGE_SOFTWARE
 
 # Tilt Scanning settings
 DEFAULT_ELEVATION_ANGLE = 40
-TILT_CHECKPOINTS = [25.0, 35.0, 55.0, DEFAULT_ELEVATION_ANGLE] 
+TILT_CHECKPOINTS = [15.0, 35.0, 55.0] 
 
 MIN_TILT = 0.0
 MAX_TILT = 70.0

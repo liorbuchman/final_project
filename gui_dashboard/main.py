@@ -82,7 +82,6 @@ SETTINGS_BOUNDS = {
     "lost_lock_timeout_s": (1.0, 10.0),
     "audio_buffer_size": (128, 1024),
 }
-
 DEFAULT_SETTINGS = {
     "system_active": False,
     "yolo_threshold_low": 0.25,
