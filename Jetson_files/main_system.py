@@ -35,7 +35,16 @@ class ComrandInBattle:
         # period before committing to a full acoustic re-search, instead of
         # reacting to the very first post-lock-loss tick.
         self.tracking_entered_at = time.time()
-        
+
+        # Watchdog telemetry: last_fsm_tick is refreshed at the top of every
+        # tactical_fsm_loop iteration; fsm_activity names whatever blocking
+        # call (if any) the FSM thread is currently inside. watchdog_loop
+        # compares against these from a separate thread to detect and log a
+        # stalled FSM loop, since the FSM thread obviously can't report on
+        # its own stall while it's blocked.
+        self.last_fsm_tick = time.time()
+        self.fsm_activity = "idle"
+
         # Thread synchronization primitive for cross-sensor data sharing
         self.data_lock = threading.Lock()
 
@@ -126,6 +135,9 @@ class ComrandInBattle:
 
         fsm_thread = threading.Thread(target=self.tactical_fsm_loop, daemon=True, name="FSMThread")
         fsm_thread.start()
+
+        watchdog_thread = threading.Thread(target=self.watchdog_loop, daemon=True, name="WatchdogThread")
+        watchdog_thread.start()
 
         # Run optical pipeline (Video streaming & YOLO) on the main thread
         self.optical_master_loop()
@@ -231,6 +243,7 @@ class ComrandInBattle:
 
         while self.running:
             curr_time = time.time()
+            self.last_fsm_tick = curr_time
 
             # Read current status from all sensors safely
             with self.data_lock:
@@ -275,7 +288,9 @@ class ComrandInBattle:
                             self.video_processor.track_target(0, 0)
                     elif cam_status == "ONLINE" and hasattr(self.video_processor, 'handle_acoustic_search'):
                         # This function handles pan and tilt sweep. Blocks until done or drone is found.
+                        self.fsm_activity = f"handle_acoustic_search(target={target_azimuth:.1f}deg)"
                         self.video_processor.handle_acoustic_search(target_azimuth)
+                        self.fsm_activity = "idle"
                         # Reset timeout only AFTER movement/scan is complete
                         with self.data_lock:
                             self.state_timestamp = time.time()
@@ -285,6 +300,9 @@ class ComrandInBattle:
                     logging.info("[FSM] Search window expired. Returning to SCANNING.")
                     if cam_status == "ONLINE":
                         self.video_processor.track_target(0, 0)
+                        self.fsm_activity = "return_to_default_elevation"
+                        self.video_processor.return_to_default_elevation()
+                        self.fsm_activity = "idle"
                     with self.data_lock:
                         self.state = SystemState.SCANNING
 
@@ -307,6 +325,28 @@ class ComrandInBattle:
                             self.video_processor.track_target(0, 0)
 
             time.sleep(0.1)
+
+    def watchdog_loop(self):
+        """
+        Independent thread that detects when tactical_fsm_loop stops
+        ticking - most commonly because it's inside a long blocking PTZ
+        slew (handle_acoustic_search / return_to_default_elevation), which
+        can legitimately run for many seconds (a full-range pan slew alone
+        can take up to ~PAN_TIME_END_TO_END). The FSM thread can't report on
+        its own stall while blocked, so this logs it from the outside:
+        when it started, how long it lasted, and which call it was stuck in.
+        """
+        stalled_since = None
+        while self.running:
+            gap = time.time() - self.last_fsm_tick
+            if gap > config.FSM_WATCHDOG_STALL_THRESHOLD and stalled_since is None:
+                stalled_since = self.last_fsm_tick
+                logging.warning(f"[Watchdog] FSM loop unresponsive - stuck in: {self.fsm_activity}")
+            elif gap <= 0.3 and stalled_since is not None:
+                total_stall = time.time() - stalled_since
+                logging.warning(f"[Watchdog] FSM loop resumed after {total_stall:.1f}s (was stuck in: {self.fsm_activity})")
+                stalled_since = None
+            time.sleep(0.5)
 
     def optical_master_loop(self):
         """High-throughput video capture loop running on native execution thread."""

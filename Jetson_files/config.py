@@ -53,8 +53,10 @@ RESPEAKER_DISABLE_HPF = True
 
 
 #Camera Physical Limits & Calibration
-MOVE_SPEED = 0.6
-MIN_ANGLE = -175              
+MOVE_SPEED = 0.6  # kept for standalone calibration/test tools (calibrate_axis.py, doa_tracker.py, etc.) - the main pipeline uses PAN_MOVE_SPEED/TILT_MOVE_SPEED below
+PAN_MOVE_SPEED = 0.9
+TILT_MOVE_SPEED = MOVE_SPEED  # tune independently from PAN_MOVE_SPEED; if changed, TILT_TIME_END_TO_END must be re-measured with the calibration tool since motor speed-to-angle isn't necessarily linear
+MIN_ANGLE = -175
 MAX_ANGLE = 175 
 PAN_RANGE_SOFTWARE = MAX_ANGLE - MIN_ANGLE
 PAN_TIME_END_TO_END = 21.17 # for speed of 0.6, measured with calibration tool            
@@ -79,6 +81,14 @@ KP_TILT = -0.0010
 KD_PAN = 0.0005
 KD_TILT = 0.0001
 TILT_DIRECTION_INVERSION = -1.0 # Inverts tilt axis for upside-down ceiling mounted PTZ
+
+# --- PTZ Hardware Comm Guardrails ---
+PTZ_MIN_SEND_INTERVAL = 0.15   # floor between real HTTP ContinuousMove sends when velocity changes - protects the camera's embedded HTTP server from PD-loop jitter during ENGAGED (stop commands bypass this)
+PTZ_KEEPALIVE_INTERVAL = 1.0   # resend an unchanged, non-zero velocity at least this often - many budget ONVIF cameras auto-stop ContinuousMove a few seconds after the last command if it isn't refreshed
+PTZ_HTTP_SLOW_THRESHOLD = 1.5  # seconds; log a warning if a single ContinuousMove HTTP call takes longer than this
+
+# --- FSM Watchdog ---
+FSM_WATCHDOG_STALL_THRESHOLD = 2.0  # seconds with no FSM tick before logging a stall warning
 
 # --- Hardware-Accelerated GStreamer Pipeline ---
 def get_gstreamer_pipeline():

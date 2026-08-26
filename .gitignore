@@ -20,11 +20,13 @@ results/
 *.engine
 *.onnx
 *.trt
+*.zip
 uav_vision/models/
 uav_acoustic/models/
 uav_acoustic/data/
 uav_vision/src/recorded_drones/
 usb_4_mic_array
+UC/
 
 # System & Environment
 __pycache__/

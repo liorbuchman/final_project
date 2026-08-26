@@ -59,12 +59,12 @@ class OpticalDetector:
         # --- PAN CALIBRATION ---
         # 1. Drive to absolute Right limit
         logger.info("[Calibration] Finding Pan Right Limit...")
-        self.track_target(-config.MOVE_SPEED, 0.0)
+        self.track_target(-config.PAN_MOVE_SPEED, 0.0)
         time.sleep(config.PAN_TIME_END_TO_END + 2.0)
-        
+
         # 2. Drive to Center
         logger.info("[Calibration] Moving Pan to absolute Center...")
-        self.track_target(config.MOVE_SPEED, 0.0)
+        self.track_target(config.PAN_MOVE_SPEED, 0.0)
         time.sleep(config.PAN_TIME_END_TO_END / 2.0)
         
         self.track_target(0.0, 0.0) 
@@ -74,15 +74,15 @@ class OpticalDetector:
         # --- TILT CALIBRATION ---
         # 1. Drive to absolute Bottom limit
         logger.info("[Calibration] Finding Tilt Bottom Limit...")
-        self.track_target(0.0, -config.MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
+        self.track_target(0.0, -config.TILT_MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
         time.sleep(config.TILT_TIME_END_TO_END + 2.0)
-        
+
         # 2. Drive up to Default Elevation
         logger.info(f"[Calibration] Moving Tilt to {config.DEFAULT_ELEVATION_ANGLE}°...")
         degrees_up = config.DEFAULT_ELEVATION_ANGLE - config.MIN_TILT
         time_up = degrees_up * config.TIME_PER_DEGREE_TILT
-        
-        self.track_target(0.0, config.MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
+
+        self.track_target(0.0, config.TILT_MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
         time.sleep(time_up)
         
         self.track_target(0.0, 0.0) 
@@ -193,13 +193,26 @@ class OpticalDetector:
         """
         Dedicated background thread to handle PTZ motor commands asynchronously.
         This prevents blocking the main thread during HTTP/SOAP requests to the camera.
+
+        Also resends the last commanded velocity on every empty-queue tick
+        (~10x/sec) whenever it's non-zero. This is what actually drives the
+        keep-alive: a long open-loop slew in handle_acoustic_search pushes a
+        command once and then blocks for up to ~20s without pushing again,
+        so without a periodic resend here the camera - many budget ONVIF PTZ
+        units auto-stop ContinuousMove a few seconds after the last command -
+        can silently stop moving while the FSM thread is still asleep,
+        counting on it. move_camera's own PTZ_KEEPALIVE_INTERVAL throttles
+        this down to one real HTTP call per second, so calling it this often
+        is cheap.
         """
+        last_pan, last_tilt = 0.0, 0.0
         while self.ptz_worker_running:
             try:
-                pan_speed, tilt_speed = self.ptz_queue.get(timeout=0.1)
-                move_camera(self.ptz, self.move_req, pan_speed, tilt_speed)
+                last_pan, last_tilt = self.ptz_queue.get(timeout=0.1)
+                move_camera(self.ptz, self.move_req, last_pan, last_tilt)
             except queue.Empty:
-                pass
+                if last_pan != 0.0 or last_tilt != 0.0:
+                    move_camera(self.ptz, self.move_req, last_pan, last_tilt)
             except Exception as e:
                 logger.error(f"[PTZ Worker] Error moving camera: {e}")
 
@@ -219,8 +232,8 @@ class OpticalDetector:
         """
         Dead-reckons current_camera_pan/current_tilt forward by the speed that
         was actually commanded during the last dt seconds. Mirrors the same
-        MOVE_SPEED-referenced calibration (TIME_PER_DEGREE_PAN/TILT) that
-        handle_acoustic_search already uses for its open-loop moves, just
+        PAN_MOVE_SPEED/TILT_MOVE_SPEED-referenced calibration (TIME_PER_DEGREE_PAN/TILT)
+        that handle_acoustic_search already uses for its open-loop moves, just
         generalized to the continuously-variable speed the PD controller in
         execute_visual_closed_loop produces - so current_camera_pan/current_tilt
         stay accurate even while closed-loop visual tracking is driving the
@@ -228,8 +241,8 @@ class OpticalDetector:
         tracking silently desynced the software's belief from the physical
         camera position).
         """
-        pan_delta = (self.prev_pan_speed / config.MOVE_SPEED) * dt / config.TIME_PER_DEGREE_PAN
-        tilt_delta = ((self.prev_tilt_speed / config.MOVE_SPEED) * dt / config.TIME_PER_DEGREE_TILT
+        pan_delta = (self.prev_pan_speed / config.PAN_MOVE_SPEED) * dt / config.TIME_PER_DEGREE_PAN
+        tilt_delta = ((self.prev_tilt_speed / config.TILT_MOVE_SPEED) * dt / config.TIME_PER_DEGREE_TILT
                        * config.TILT_DIRECTION_INVERSION)
 
         self.current_camera_pan = max(config.MIN_ANGLE, min(config.MAX_ANGLE,
@@ -353,7 +366,7 @@ class OpticalDetector:
             logger.info(f"[Optical] Slew {direction} by {degrees_to_move:.1f} degrees (Target: {safe_target})...")
             
             # Invert X axis based on hardware specifics (Right is negative)
-            x_speed = -config.MOVE_SPEED if direction == "Right" else config.MOVE_SPEED
+            x_speed = -config.PAN_MOVE_SPEED if direction == "Right" else config.PAN_MOVE_SPEED
             # Start pan motor
             self.track_target(x_speed, 0.0)
             sleep_time = degrees_to_move * config.TIME_PER_DEGREE_PAN
@@ -401,7 +414,7 @@ class OpticalDetector:
             
             if abs(tilt_diff) >= 2.0:
                 logger.info(f"[Optical] Macro-Slewing TILT to {target_tilt}°...")
-                y_speed = (config.MOVE_SPEED if tilt_diff > 0 else -config.MOVE_SPEED) * config.TILT_DIRECTION_INVERSION
+                y_speed = (config.TILT_MOVE_SPEED if tilt_diff > 0 else -config.TILT_MOVE_SPEED) * config.TILT_DIRECTION_INVERSION
                 time_to_tilt = abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
                 
                 # --- 1. MOVE (Fast Slew) ---
@@ -437,7 +450,34 @@ class OpticalDetector:
                 logger.info(f"*** TARGET VISUALLY ACQUIRED at ~{self.current_tilt}°! ***")
                 break
 
-        # old version of tracking the drone after YOLO detection 
+    def return_to_default_elevation(self):
+        """
+        Re-centers TILT to DEFAULT_ELEVATION_ANGLE. Meant to be called once a
+        search is given up on (FSM reverting TRACKING -> SCANNING). Without
+        this, a session that ends mid vertical-macro-scan (parked at a
+        TILT_CHECKPOINTS extreme like 55 deg/15 deg) or right after ENGAGED's
+        closed-loop PD tracking (parked at whatever arbitrary angle the
+        target was last at) leaves the camera sitting there indefinitely,
+        since SCANNING itself never touches tilt.
+        """
+        target_tilt = config.DEFAULT_ELEVATION_ANGLE
+        tilt_diff = target_tilt - self.current_tilt
+        if abs(tilt_diff) < 2.0:
+            return
+
+        logger.info(f"[Optical] Returning TILT to default elevation ({target_tilt}°)...")
+        y_speed = (config.TILT_MOVE_SPEED if tilt_diff > 0 else -config.TILT_MOVE_SPEED) * config.TILT_DIRECTION_INVERSION
+        time_to_tilt = abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
+
+        self.track_target(0.0, y_speed)
+        target_found_during_move = self._sleep_and_check_lock(time_to_tilt)
+        self.track_target(0.0, 0.0)
+        self.current_tilt = target_tilt
+
+        if target_found_during_move:
+            logger.info(f"[Optical] Target reacquired while returning to default elevation at ~{self.current_tilt:.1f}°")
+
+        # old version of tracking the drone after YOLO detection
         # def execute_visual_closed_loop(self): 
         #     """
         #     Phase 2: Visual Tracking - Zoned Control with Deadband for ONVIF Optimization.
