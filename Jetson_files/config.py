@@ -13,7 +13,7 @@ RTSP_URL = "rtsp://admin:admin@192.168.1.90:554/live/ch0"
 CAMERA_IP = '192.168.1.90'
 CAMERA_USER = 'admin'
 CAMERA_PASS = 'admin'
-YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "models", "best_v6.engine")
+YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "models", "best_v8.engine")
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 YOLO_LOW_CONF_THRESHOLD = 0.25
@@ -54,12 +54,12 @@ RESPEAKER_DISABLE_HPF = True
 
 #Camera Physical Limits & Calibration
 MOVE_SPEED = 0.6  # kept for standalone calibration/test tools (calibrate_axis.py, doa_tracker.py, etc.) - the main pipeline uses PAN_MOVE_SPEED/TILT_MOVE_SPEED below
-PAN_MOVE_SPEED = 0.9
+PAN_MOVE_SPEED = 0.95
 TILT_MOVE_SPEED = MOVE_SPEED  # tune independently from PAN_MOVE_SPEED; if changed, TILT_TIME_END_TO_END must be re-measured with the calibration tool since motor speed-to-angle isn't necessarily linear
 MIN_ANGLE = -175
 MAX_ANGLE = 175 
 PAN_RANGE_SOFTWARE = MAX_ANGLE - MIN_ANGLE
-PAN_TIME_END_TO_END = 21.17 # for speed of 0.6, measured with calibration tool            
+PAN_TIME_END_TO_END = 17.66 # for speed of 0.95, measured with calibration tool            
 TIME_PER_DEGREE_PAN = PAN_TIME_END_TO_END / PAN_RANGE_SOFTWARE
 
 # Tilt Scanning settings
@@ -69,7 +69,7 @@ TILT_CHECKPOINTS = [55.0, 15.0, DEFAULT_ELEVATION_ANGLE]
 MIN_TILT = 0.0
 MAX_TILT = 70.0
 TILT_RANGE_SOFTWARE = MAX_TILT - MIN_TILT
-TILT_TIME_END_TO_END = 3.76 # for speed of 0.6, measured with calibration tool
+TILT_TIME_END_TO_END = 3.8 # for speed of 0.6, measured with calibration tool
 TIME_PER_DEGREE_TILT = TILT_TIME_END_TO_END / TILT_RANGE_SOFTWARE
 
 # --- FSM Tactical Timeouts & Visual Tracking ---
