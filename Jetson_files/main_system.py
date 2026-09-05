@@ -45,6 +45,13 @@ class ComrandInBattle:
         self.last_fsm_tick = time.time()
         self.fsm_activity = "idle"
 
+        # Periodic PTZ re-home: last time acoustic OR visual activity was seen
+        # in ANY state, and a flag while a re-home thread is running. After
+        # PERIODIC_REHOME_IDLE_SECS of continuous quiet in SCANNING the FSM
+        # spawns _periodic_rehome() to correct accumulated open-loop drift.
+        self.last_activity_ts = time.time()
+        self.rehoming = False
+
         # Thread synchronization primitive for cross-sensor data sharing
         self.data_lock = threading.Lock()
 
@@ -153,7 +160,31 @@ class ComrandInBattle:
         with self.data_lock:
             self.state = SystemState.SCANNING
             self.state_timestamp = time.time()
+        self.last_activity_ts = time.time()
         logging.info("[System] Calibration Phase Complete. Grid is now active in SCANNING mode.")
+
+    def _periodic_rehome(self):
+        """Runs auto_calibrate_and_home on its own thread to correct accumulated
+        open-loop position drift after PERIODIC_REHOME_IDLE_SECS of continuous
+        quiet in SCANNING. self.rehoming gates the FSM so it won't start a
+        track while the camera is driving to its mechanical reference (worst
+        case ~40s; there is no mid-re-home abort - the 3-minute idle
+        precondition makes that an acceptable trade for a correct position
+        estimate). Re-homes both axes unless PERIODIC_REHOME_TILT_ENABLED is
+        False, in which case PAN only."""
+        logging.info("[System] Idle in SCANNING - running periodic PTZ re-home...")
+        try:
+            with self.data_lock:
+                cam_ok = (self.optical_hw_status == "ONLINE")
+            if cam_ok:
+                self.video_processor.auto_calibrate_and_home(
+                    calibrate_tilt=getattr(config, 'PERIODIC_REHOME_TILT_ENABLED', True))
+                logging.info("[System] Periodic PTZ re-home complete.")
+        except Exception as e:
+            logging.error(f"[System] Periodic re-home failed: {e}")
+        finally:
+            self.rehoming = False
+            self.last_activity_ts = time.time()
 
     def acoustic_background_loop(self):
         """Continuous audio capture and processing loop running on a dedicated thread."""
@@ -253,65 +284,90 @@ class ComrandInBattle:
                 cam_status = self.optical_hw_status
                 current_state = self.state
 
+            # Activity clock for the periodic-re-home idle timer: any acoustic
+            # or visual contact in any state resets it.
+            if audio_alert or video_lock:
+                self.last_activity_ts = curr_time
+
+            vp = self.video_processor
+            self.fsm_activity = f"search:{vp.search_phase_name()}" if vp.search_active() else "idle"
+
             # --- Finite State Machine Logic ---
             if current_state == SystemState.CALIBRATING:
                 # Wait for calibration to complete
                 pass
+
             elif current_state == SystemState.SCANNING:
-                if audio_alert:
-                    logging.info(f"[FSM] Drone detected acoustically at {target_azimuth}°. Transitioning to TRACKING.")
+                # Advance a pending non-blocking tilt-home, if one is running.
+                if cam_status == "ONLINE" and vp.tilt_home_active():
+                    vp.step_tilt_home()
+
+                if audio_alert and not self.rehoming and not vp.tilt_home_active():
+                    logging.info(f"[FSM] Drone detected acoustically at {target_azimuth:.1f}°. Transitioning to TRACKING.")
                     with self.data_lock:
                         self.state = SystemState.TRACKING
                         self.state_timestamp = curr_time
                     self.tracking_entered_at = curr_time
+                elif (getattr(config, 'PERIODIC_REHOME_ENABLED', False)
+                      and not self.rehoming
+                      and cam_status == "ONLINE"
+                      and not vp.tilt_home_active()
+                      and curr_time - self.last_activity_ts > config.PERIODIC_REHOME_IDLE_SECS):
+                    self.rehoming = True
+                    threading.Thread(target=self._periodic_rehome, daemon=True,
+                                     name="RehomeThread").start()
 
             elif current_state == SystemState.TRACKING:
-                # 1. Target found visually -> ENGAGE
                 if video_lock:
+                    # Target found visually -> ENGAGE.
                     logging.info("[FSM] Target visually locked! Transitioning to ENGAGED.")
+                    if cam_status == "ONLINE":
+                        vp.abort_acoustic_search()   # halts motors + books partial motion
                     with self.data_lock:
                         self.state = SystemState.ENGAGED
                     last_seen_visual_time = curr_time
-                    if cam_status == "ONLINE":
-                        self.video_processor.track_target(0, 0) # Stop scan motors
+                else:
+                    grace = (curr_time - self.tracking_entered_at) < config.RE_SEARCH_GRACE_PERIOD
 
-                # 2. Moving camera to search for target
-                elif audio_alert:
-                    time_in_tracking = curr_time - self.tracking_entered_at
-                    if time_in_tracking < config.RE_SEARCH_GRACE_PERIOD:
-                        # Grace period: hold position instead of immediately
-                        # committing to a full blocking macro-scan - gives vision
-                        # a brief window to reacquire on its own after a momentary
-                        # dropout, and avoids reacting to a single noisy acoustic
-                        # trigger the instant lock is lost.
-                        if cam_status == "ONLINE":
-                            self.video_processor.track_target(0, 0)
-                    elif cam_status == "ONLINE" and hasattr(self.video_processor, 'handle_acoustic_search'):
-                        # This function handles pan and tilt sweep. Blocks until done or drone is found.
-                        self.fsm_activity = f"handle_acoustic_search(target={target_azimuth:.1f}deg)"
-                        self.video_processor.handle_acoustic_search(target_azimuth)
-                        self.fsm_activity = "idle"
-                        # Reset timeout only AFTER movement/scan is complete
+                    if cam_status == "ONLINE":
+                        if vp.search_active():
+                            # Drive an in-flight search to its natural stopping
+                            # point every tick - even if acoustic contact drops
+                            # this instant - so an open-loop slew can't keep
+                            # running unmanaged. ONE phase transition per tick;
+                            # never blocks, so the loop keeps ticking (watchdog
+                            # quiet, fresh DOA consumed).
+                            vp.step_acoustic_search(target_azimuth)
+                        elif grace:
+                            # Hold position, give vision a brief window to
+                            # reacquire on its own before a macro-scan starts.
+                            vp.track_target(0, 0)
+                        elif audio_alert and not vp.search_recently_ran(target_azimuth):
+                            vp.start_acoustic_search(target_azimuth)   # stepped next tick
+                        else:
+                            vp.track_target(0, 0)   # holding: no contact, or between re-sweeps
+
+                    # Lost-timer: only counts down with no acoustic contact AND
+                    # no search running - either one keeps it fed.
+                    if audio_alert or vp.search_active():
                         with self.data_lock:
-                            self.state_timestamp = time.time()
-
-                # 3. Timeout - Target lost, revert to scan
-                elif curr_time - self.state_timestamp > config.TARGET_LOST_TIMEOUT:
-                    logging.info("[FSM] Search window expired. Returning to SCANNING.")
-                    if cam_status == "ONLINE":
-                        self.video_processor.track_target(0, 0)
-                        self.fsm_activity = "return_to_default_elevation"
-                        self.video_processor.return_to_default_elevation()
-                        self.fsm_activity = "idle"
-                    with self.data_lock:
-                        self.state = SystemState.SCANNING
+                            self.state_timestamp = curr_time
+                    elif curr_time - self.state_timestamp > config.TARGET_LOST_TIMEOUT:
+                        logging.info("[FSM] Search window expired. Returning to SCANNING.")
+                        if cam_status == "ONLINE":
+                            vp.abort_acoustic_search()
+                            if getattr(config, 'RETURN_TO_DEFAULT_ELEVATION_ON_LOST', True):
+                                vp.start_tilt_home()   # non-blocking; stepped from SCANNING
+                        with self.data_lock:
+                            self.state = SystemState.SCANNING
+                        self.last_activity_ts = curr_time
 
             elif current_state == SystemState.ENGAGED:
                 # Continue visual tracking
                 if video_lock:
                     last_seen_visual_time = curr_time
                     if cam_status == "ONLINE":
-                        self.video_processor.execute_visual_closed_loop()
+                        vp.execute_visual_closed_loop()
                 # Target lost briefly
                 else:
                     time_since_last_sight = curr_time - last_seen_visual_time
@@ -322,30 +378,38 @@ class ComrandInBattle:
                             self.state_timestamp = curr_time
                         self.tracking_entered_at = curr_time
                         if cam_status == "ONLINE":
-                            self.video_processor.track_target(0, 0)
+                            vp.abort_acoustic_search()
+                            vp.track_target(0, 0)
 
             time.sleep(0.1)
 
     def watchdog_loop(self):
         """
-        Independent thread that detects when tactical_fsm_loop stops
-        ticking - most commonly because it's inside a long blocking PTZ
-        slew (handle_acoustic_search / return_to_default_elevation), which
-        can legitimately run for many seconds (a full-range pan slew alone
-        can take up to ~PAN_TIME_END_TO_END). The FSM thread can't report on
-        its own stall while blocked, so this logs it from the outside:
-        when it started, how long it lasted, and which call it was stuck in.
+        Independent thread that detects when tactical_fsm_loop stops ticking.
+        Since the acoustic search / tilt-home are now non-blocking state
+        machines advanced one step per tick, the FSM thread should never stall
+        in normal operation - a fired warning here now means a genuine hang
+        (a wedged ONVIF HTTP call inside execute_visual_closed_loop's
+        track_target, a GIL-starving GPU call, etc.), not an expected long slew.
+
+        fsm_activity is snapshotted at stall-detection time and reported
+        verbatim on resume, so "resumed ... was stuck in: X" names what the
+        loop was actually doing when it froze (it previously re-read the live
+        value, which had usually already been reset to "idle").
         """
         stalled_since = None
+        stalled_activity = None
         while self.running:
             gap = time.time() - self.last_fsm_tick
             if gap > config.FSM_WATCHDOG_STALL_THRESHOLD and stalled_since is None:
                 stalled_since = self.last_fsm_tick
-                logging.warning(f"[Watchdog] FSM loop unresponsive - stuck in: {self.fsm_activity}")
+                stalled_activity = self.fsm_activity
+                logging.warning(f"[Watchdog] FSM loop unresponsive - stuck in: {stalled_activity}")
             elif gap <= 0.3 and stalled_since is not None:
                 total_stall = time.time() - stalled_since
-                logging.warning(f"[Watchdog] FSM loop resumed after {total_stall:.1f}s (was stuck in: {self.fsm_activity})")
+                logging.warning(f"[Watchdog] FSM loop resumed after {total_stall:.1f}s (was stuck in: {stalled_activity})")
                 stalled_since = None
+                stalled_activity = None
             time.sleep(0.5)
 
     def optical_master_loop(self):

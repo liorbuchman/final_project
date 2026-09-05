@@ -79,9 +79,9 @@ def move_camera(ptz, request, x, y):
       velocity. Many budget ONVIF PTZ cameras silently auto-stop
       ContinuousMove a few seconds after the last command if it isn't
       refreshed (no Timeout element below guarantees they won't); a long
-      open-loop slew in handle_acoustic_search otherwise sends one command
-      and then blocks for up to ~20s, so without this the camera can sit
-      physically still while the software keeps dead-reckoning
+      open-loop pan phase in the acoustic search otherwise sends one command
+      and then does not re-push it for up to ~20s, so without this the camera
+      can sit physically still while the software keeps dead-reckoning
       current_camera_pan/current_tilt as if it were still moving.
     """
     global last_pan_speed, last_tilt_speed, last_send_time

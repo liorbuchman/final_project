@@ -43,6 +43,14 @@ class AcousticDetector:
         self.trigger_on_streak = 0
         self.trigger_off_streak = 0
 
+        # Energy-gate hysteresis latch + last-event-end clock. The energy gate
+        # used to hard-reset the event (and wipe the DOA filter) on a single
+        # quiet buffer; now it feeds the OFF debounce streak like any other
+        # "below threshold" observation, and the DOA smoothing history is only
+        # dropped when a genuinely new event starts after a real gap.
+        self._energy_gate_open = False
+        self._last_event_end_time = 0.0
+
         # Exact DSP matching parameters from config (Single Source of Truth)
         self.sr = config.SAMPLE_RATE
         self.n_mels = config.MEL_N_MELS
@@ -151,20 +159,34 @@ class AcousticDetector:
         ch = getattr(config, 'AUDIO_CHANNEL', 0)
         y_chunk = raw_buffer[:, ch].astype(np.float32) / 32768.0
 
-        # Step 1: Energy Gating Check (Problem 1 - prevents false positives from background noise)
+        on_confirm = getattr(config, 'AUDIO_TRIGGER_ON_CONFIRM_COUNT', 2)
+        off_confirm = getattr(config, 'AUDIO_TRIGGER_OFF_CONFIRM_COUNT', 4)
+
+        # Step 1: Energy gate - now hysteretic, and a "below threshold" buffer is
+        # treated exactly like a low classification score: it feeds the OFF
+        # debounce streak instead of instantly killing the event. A single quiet
+        # buffer between rotor-noise peaks no longer ends the event or wipes the
+        # DOA smoothing history (which caused EVENT START/END to churn ~1-2s and
+        # defeated apply_azimuth_smoothing entirely).
         rms_energy = float(np.sqrt(np.mean(y_chunk ** 2)))
+        energy_ok = True
         if getattr(config, 'ENABLE_ENERGY_GATE', True):
-            if rms_energy < getattr(config, 'AUDIO_MIN_RMS_THRESHOLD', 0.025):
-                if self.is_triggered:
-                    logger.info(f"EVENT END - Energy below threshold (RMS: {rms_energy:.4f})")
+            gate_on = getattr(config, 'AUDIO_MIN_RMS_THRESHOLD', 0.025)
+            gate_off = min(getattr(config, 'AUDIO_RMS_GATE_OFF_THRESHOLD', gate_on), gate_on)
+            energy_ok = (rms_energy >= gate_off) if self._energy_gate_open else (rms_energy >= gate_on)
+            self._energy_gate_open = energy_ok
+
+        if not energy_ok:
+            self.trigger_off_streak += 1
+            self.trigger_on_streak = 0
+            if self.is_triggered and self.trigger_off_streak >= off_confirm:
+                logger.info(f"EVENT END - Energy below threshold (RMS: {rms_energy:.4f})")
                 self.is_triggered = False
-                self.lock_initialized = False
-                self.trigger_on_streak = 0
-                self.trigger_off_streak = 0
-                if self.leds:
-                    self.set_led_color(0x001100) # Soft Green
-                return 0.0
-        
+                self._last_event_end_time = time.time()
+            if not self.is_triggered and self.leds:
+                self.set_led_color(0x001100) # Soft Green
+            return 0.0
+
         # Normalize chunk for CNN matching
         y_norm = y_chunk.copy()
         max_amp = np.max(np.abs(y_norm))
@@ -192,16 +214,21 @@ class AcousticDetector:
         # of the threshold is required before is_triggered actually flips, so
         # a single noisy CNN frame can't flicker the FSM's audio_alert signal
         # (see EVENT START/END logs previously firing under a second apart).
-        on_confirm = getattr(config, 'AUDIO_TRIGGER_ON_CONFIRM_COUNT', 2)
-        off_confirm = getattr(config, 'AUDIO_TRIGGER_OFF_CONFIRM_COUNT', 4)
-
         if prediction_score > config.AUDIO_CLASSIFICATION_THRESHOLD:
             self.trigger_on_streak += 1
             self.trigger_off_streak = 0
 
             if not self.is_triggered and self.trigger_on_streak >= on_confirm:
                 logger.warning(f"EVENT START - Target detected. Initial Confidence: {prediction_score:.4f}")
-                self.lock_initialized = False # Force lock reset to capture new position on event start
+                # Only forget the DOA smoothing history when this is a genuinely
+                # new target - i.e. the previous event ended more than
+                # DOA_FILTER_RESET_GAP_SECS ago. A quick re-trigger after a brief
+                # dropout keeps last_valid_azimuth so the EMA + outlier filter
+                # stay continuous across the blip instead of taking a raw
+                # (possibly front/back-mirrored) hardware angle at face value.
+                gap = time.time() - self._last_event_end_time
+                if gap > getattr(config, 'DOA_FILTER_RESET_GAP_SECS', 3.0):
+                    self.lock_initialized = False
                 self.is_triggered = True
                 if self.leds:
                     self.set_led_color(0xFF0000) # Bright Red
@@ -216,7 +243,7 @@ class AcousticDetector:
             if self.is_triggered and self.trigger_off_streak >= off_confirm:
                 logger.info("EVENT END - Target tracking lost or cleared.")
                 self.is_triggered = False
-                self.lock_initialized = False
+                self._last_event_end_time = time.time()
                 if self.leds:
                     self.set_led_color(0x001100) # Soft Green
 
@@ -247,7 +274,7 @@ class AcousticDetector:
                 self.outlier_streak_count = 1
             else:
                 cand_diff = abs((raw_azimuth - self.candidate_azimuth + 180.0) % 360.0 - 180.0)
-                if cand_lib := (cand_diff < max_jump):
+                if cand_diff < max_jump:
                     self.outlier_streak_count += 1
                 else:
                     self.candidate_azimuth = raw_azimuth

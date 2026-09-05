@@ -24,6 +24,7 @@ results/
 uav_vision/models/
 uav_acoustic/models/
 uav_acoustic/data/
+uav_acoustic/src/fine_tunning_model.py
 uav_vision/src/recorded_drones/
 usb_4_mic_array
 UC/

@@ -20,6 +20,11 @@ YOLO_LOW_CONF_THRESHOLD = 0.25
 YOLO_HIGH_CONF_THRESHOLD = 0.5
 SAVE_LAST_FRAME_FLAG = False
 
+# --- Visual lock stability (OpticalDetector.run_inference) ---
+YOLO_LOCK_HOLD_FRAMES = 15            # frames visual_lock is bridged after the target stops being detected at all
+YOLO_ID_RELEASE_FRAMES = 12          # frames the locked ByteTrack track-id may go unmatched before the lock is released (position is held, not handed to a distractor, during this grace)
+YOLO_LOCK_MAX_LOWCONF_FRAMES = 25    # drop the lock after this many consecutive frames with NO detection at/above YOLO_HIGH_CONF_THRESHOLD - the target has degraded to noise (implements "not just: there is something")
+
 # --- Acoustic Settings ---
 AUDIO_MODEL_DIR = os.path.join(BASE_DIR, "uav_acoustic", "models")
 IDVENDOR = 0x2886
@@ -40,9 +45,11 @@ RESPEAKER_INDEX = 0
 SMOOTHING_WINDOW = 1
 ENABLE_ENERGY_GATE = True
 AUDIO_MIN_RMS_THRESHOLD = 0.025 #enrgey lower threshod -> going to be zero
-DOA_SMOOTHING_ALPHA = 0.35         
-DOA_MAX_JUMP_DEG = 30.0  
-DOA_OUTLIER_CONFIRM_COUNT = 3           
+DOA_SMOOTHING_ALPHA = 0.35
+DOA_MAX_JUMP_DEG = 30.0
+DOA_OUTLIER_CONFIRM_COUNT = 3
+AUDIO_RMS_GATE_OFF_THRESHOLD = 0.018   # hysteresis floor: once the energy gate is open it stays open until RMS drops below this (<= AUDIO_MIN_RMS_THRESHOLD). A single sub-threshold buffer no longer force-ends an event / wipes the DOA filter - it feeds the same OFF debounce streak as a low classification score.
+DOA_FILTER_RESET_GAP_SECS = 3.0        # a new EVENT START within this many seconds of the previous EVENT END keeps the DOA smoothing/outlier history instead of re-seeding from a raw hardware angle
 
 #dsp card function  
 RESPEAKER_TUNE_DSP = True #endable DSP tuning for ReSpeaker V3.1
@@ -74,8 +81,21 @@ TIME_PER_DEGREE_TILT = TILT_TIME_END_TO_END / TILT_RANGE_SOFTWARE
 
 # --- FSM Tactical Timeouts & Visual Tracking ---
 TARGET_LOST_TIMEOUT = 4
-VISUAL_LOCK_COOLDOWN = 1.5
-RE_SEARCH_GRACE_PERIOD = 1.0  # seconds to hold position after entering TRACKING before a full acoustic macro-scan starts
+VISUAL_LOCK_COOLDOWN = 2.5    # seconds ENGAGED tolerates no visual lock before reverting to TRACKING (was 1.5 - widened to stop ENGAGED<->TRACKING flapping)
+RE_SEARCH_GRACE_PERIOD = 2.0  # seconds to hold position after entering TRACKING before a non-blocking acoustic macro-scan starts (was 1.0)
+VISUAL_ERROR_STALE_SECS = 0.5  # execute_visual_closed_loop halts the motors if the visual error hasn't been refreshed by a real detection within this window (bounds blind slewing during an id-grace bridge)
+
+# --- Non-blocking acoustic search (OpticalDetector.start/step_acoustic_search) ---
+SEARCH_TILT_STARE_SECS = 0.8       # dwell time at each vertical macro-scan checkpoint while the camera stares for a YOLO lock
+SEARCH_PAN_REPLAN_DEG = 15.0       # while slewing to the acoustic azimuth, re-issue the pan move if a fresh DOA differs from the in-progress target by more than this many degrees (0 disables)
+SEARCH_RESCAN_MIN_INTERVAL = 2.0   # minimum seconds between two full macro-scans aimed at (roughly) the same azimuth - stops a tight re-sweep loop on a stationary acoustic target that can't be seen
+RETURN_TO_DEFAULT_ELEVATION_ON_LOST = True  # tilt back to DEFAULT_ELEVATION_ANGLE (non-blocking) when a search is abandoned and the FSM returns to SCANNING
+
+# --- Periodic PTZ Re-Home (open-loop position-drift correction) ---
+PERIODIC_REHOME_ENABLED = True
+PERIODIC_REHOME_IDLE_SECS = 180.0     # continuous time in SCANNING with no acoustic/visual activity before an automatic re-home runs on its own thread
+PERIODIC_REHOME_TILT_ENABLED = True   # include the timed TILT homing in the periodic re-home; False re-homes PAN only and leaves TILT untouched
+
 KP_PAN = 0.0015
 KP_TILT = -0.0010
 KD_PAN = 0.0005

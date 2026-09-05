@@ -22,7 +22,16 @@ class OpticalDetector:
         self.high_conf_achieved = False
         self.visual_lock = False
         self.lock_hold_counter = 0
-        
+
+        # ByteTrack track-id continuity: once a strong detection acquires the
+        # lock we follow *that* track id, not "whichever box is highest-conf
+        # this frame". Stops the lock hopping between distractors and stops a
+        # single 0.5 frame latching high_conf_achieved forever on junk.
+        self.locked_track_id = None
+        self.id_missing_frames = 0     # frames the locked id has been unmatched (grace = YOLO_ID_RELEASE_FRAMES)
+        self.lowconf_frames = 0        # consecutive frames with no detection >= YOLO_HIGH_CONF_THRESHOLD (ceiling = YOLO_LOCK_MAX_LOWCONF_FRAMES)
+        self.last_error_update = 0.0   # time.time() of the last box-derived error write (staleness guard in execute_visual_closed_loop)
+
         # Tracking telemetry offsets
         self.error_x = 0.0
         self.error_y = 0.0
@@ -44,18 +53,49 @@ class OpticalDetector:
         self.prev_pan_speed = 0.0
         self.prev_tilt_speed = 0.0
 
-    def auto_calibrate_and_home(self):
+        # --- Non-blocking acoustic-search state machine -------------------
+        # Replaces the old blocking handle_acoustic_search(): the FSM thread
+        # now advances this ONE phase transition per 10Hz tick instead of
+        # blocking for up to ~25s (which froze DOA intake, the lost-timer and
+        # the watchdog). Phases: idle -> pan -> tilt_move -> tilt_stare -> done.
+        self._search_phase = "idle"
+        self._search_result = None            # None | "acquired" | "exhausted"
+        self._search_target_az = 0.0
+        self._search_phase_started = 0.0
+        self._search_phase_deadline = 0.0
+        self._search_pan_dir = "None"
+        self._search_pan_target = 0.0
+        self._search_pan_from = 0.0
+        self._search_pan_degs = 0.0
+        self._search_tilt_idx = 0
+        self._search_tilt_target = 0.0
+        self._search_tilt_from = 0.0
+        self._search_tilt_degs = 0.0
+        self._search_last_az = None
+        self._search_last_finished = 0.0
+
+        # --- Non-blocking "return tilt to default elevation" mini-move ----
+        self._tilt_home_phase = "idle"        # idle | moving
+        self._tilt_home_deadline = 0.0
+        self._tilt_home_target = 0.0
+
+    def auto_calibrate_and_home(self, calibrate_tilt=True):
         """
         Executes physical homing sequence using deterministic open-loop control.
-        Assumes PAN_TIME_END_TO_END and TILT_TIME_END_TO_END in config.py 
+        Assumes PAN_TIME_END_TO_END and TILT_TIME_END_TO_END in config.py
         are perfectly measured via a manual stopwatch test.
+
+        calibrate_tilt=False re-homes PAN only and leaves TILT where it is -
+        used by the periodic re-home when PERIODIC_REHOME_TILT_ENABLED is off.
+        Runs on its own thread (calibration_routine / _periodic_rehome), never
+        on the FSM thread, so its blocking sleeps are fine.
         """
         if self.ptz is None:
             logger.error("[Calibration] PTZ connection missing!")
             return False
 
         logger.info("[Calibration] STARTING DETERMINISTIC HOMING...")
-        
+
         # --- PAN CALIBRATION ---
         # 1. Drive to absolute Right limit
         logger.info("[Calibration] Finding Pan Right Limit...")
@@ -72,21 +112,24 @@ class OpticalDetector:
         time.sleep(0.5) 
 
         # --- TILT CALIBRATION ---
-        # 1. Drive to absolute Bottom limit
-        logger.info("[Calibration] Finding Tilt Bottom Limit...")
-        self.track_target(0.0, -config.TILT_MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
-        time.sleep(config.TILT_TIME_END_TO_END + 2.0)
+        if calibrate_tilt:
+            # 1. Drive to absolute Bottom limit
+            logger.info("[Calibration] Finding Tilt Bottom Limit...")
+            self.track_target(0.0, -config.TILT_MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
+            time.sleep(config.TILT_TIME_END_TO_END + 2.0)
 
-        # 2. Drive up to Default Elevation
-        logger.info(f"[Calibration] Moving Tilt to {config.DEFAULT_ELEVATION_ANGLE}°...")
-        degrees_up = config.DEFAULT_ELEVATION_ANGLE - config.MIN_TILT
-        time_up = degrees_up * config.TIME_PER_DEGREE_TILT
+            # 2. Drive up to Default Elevation
+            logger.info(f"[Calibration] Moving Tilt to {config.DEFAULT_ELEVATION_ANGLE}°...")
+            degrees_up = config.DEFAULT_ELEVATION_ANGLE - config.MIN_TILT
+            time_up = degrees_up * config.TIME_PER_DEGREE_TILT
 
-        self.track_target(0.0, config.TILT_MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
-        time.sleep(time_up)
-        
-        self.track_target(0.0, 0.0) 
-        self.current_tilt = config.DEFAULT_ELEVATION_ANGLE
+            self.track_target(0.0, config.TILT_MOVE_SPEED * config.TILT_DIRECTION_INVERSION)
+            time.sleep(time_up)
+
+            self.track_target(0.0, 0.0)
+            self.current_tilt = config.DEFAULT_ELEVATION_ANGLE
+        else:
+            logger.info("[Calibration] TILT homing skipped (calibrate_tilt=False) - PAN only.")
 
         logger.info("[Calibration] HOMING COMPLETE! Camera centered.")
         return True
@@ -127,11 +170,31 @@ class OpticalDetector:
                           verbose=False)
         print(f"[Optical] Vision pipeline hot on native execution target: {config.DEVICE}")
 
+    def _clear_visual_lock(self):
+        """Full reset of the visual-tracking state - back to 'need a strong
+        detection to (re)acquire'."""
+        self.visual_lock = False
+        self.high_conf_achieved = False
+        self.lock_hold_counter = 0
+        self.lowconf_frames = 0
+        self.locked_track_id = None
+        self.id_missing_frames = 0
+
     def run_inference(self, frame):
-        """Processes 640x480 frame matrices on GPU and extracts spatial target center errors."""
+        """Runs YOLO+ByteTrack and maintains visual_lock with three hysteresis
+        mechanisms working together:
+          1. track-id continuity  - follow the id we locked onto, not the
+             highest-conf box of the frame (stops lock-hopping between drones);
+          2. id-miss grace        - if that id is briefly unmatched, HOLD
+             position for YOLO_ID_RELEASE_FRAMES rather than snapping to a
+             distractor or dropping the lock;
+          3. low-confidence ceiling - drop the lock after
+             YOLO_LOCK_MAX_LOWCONF_FRAMES frames with nothing >= HIGH_CONF,
+             so a single 0.5 frame can't keep us chasing 0.3 noise forever.
+        """
         if config.SAVE_LAST_FRAME_FLAG:
-            #logger.info(f"[DEBUG] Frame shape before YOLO: {frame.shape}")
             cv2.imwrite("what_yolo_actually_sees.jpg", frame)
+
         use_half = (config.DEVICE.type == 'cuda')
         results = self.model.track(frame,
                                    stream=False,
@@ -141,54 +204,112 @@ class OpticalDetector:
                                    conf=config.YOLO_LOW_CONF_THRESHOLD,
                                    device=config.DEVICE,
                                    verbose=False)
-        detected_this_frame = False
-        
+
+        hold_frames     = getattr(config, 'YOLO_LOCK_HOLD_FRAMES', 15)
+        id_release      = getattr(config, 'YOLO_ID_RELEASE_FRAMES', 12)
+        lowconf_ceiling = getattr(config, 'YOLO_LOCK_MAX_LOWCONF_FRAMES', 25)
+
+        boxes = []
         for r in results:
-            if len(r.boxes) > 0:
-                sorted_boxes = sorted(r.boxes, key=lambda b: float(b.conf[0]), reverse=True)
-                box =sorted_boxes[0]
-                yolo_conf = float(box.conf[0])
-                
+            if r.boxes is not None and len(r.boxes) > 0:
+                boxes = list(r.boxes)
+            break
 
-                if yolo_conf >= config.YOLO_HIGH_CONF_THRESHOLD:
-                    self.high_conf_achieved = True
-                    self.lock_hold_counter = 15
-            
-                if self.high_conf_achieved or self.lock_hold_counter > 0:
+        def _bid(b):
+            try:
+                return int(b.id[0]) if b.id is not None else None
+            except Exception:
+                return None
+
+        chosen = None
+        chosen_conf = 0.0
+
+        # 1. Follow the locked track id if it's on screen.
+        if self.locked_track_id is not None:
+            for b in boxes:
+                if _bid(b) == self.locked_track_id:
+                    chosen = b
+                    chosen_conf = float(b.conf[0])
+                    break
+            if chosen is not None:
+                self.id_missing_frames = 0
+            else:
+                self.id_missing_frames += 1
+                if self.id_missing_frames < id_release:
+                    # 2. Grace: keep the lock, hold last-known error, do NOT
+                    # grab a different box this frame. execute_visual_closed_loop's
+                    # VISUAL_ERROR_STALE_SECS guard stops the motors so we don't
+                    # slew blind on a stale error while bridging.
                     self.visual_lock = True
-                    detected_this_frame = True
-                    yolo_conf_percent = int(yolo_conf * 100)
-                    logger.info(f"[YOLO] Drone visually detected! Visual Confidence: {yolo_conf:.2f}")
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    
-                    center_x = (x1 + x2) // 2
-                    center_y = (y1 + y2) // 2
+                    if self.lock_hold_counter > 0:
+                        self.lock_hold_counter -= 1
+                    return frame
+                logger.info(f"[YOLO] Track id {self.locked_track_id} unmatched for "
+                            f"{self.id_missing_frames} frames - releasing lock.")
+                self.locked_track_id = None
+                self.id_missing_frames = 0
 
-                    with self.error_lock:
-                        self.error_x = center_x - (config.FRAME_WIDTH // 2)
-                        self.error_y = center_y - (config.FRAME_HEIGHT // 2)
-                    
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
+        # 3. No locked id (or just released): (re)acquire on a strong detection,
+        #    or bridge on a weak one only if we're already inside a lock session.
+        if chosen is None and boxes:
+            best = max(boxes, key=lambda b: float(b.conf[0]))
+            best_conf = float(best.conf[0])
+            if best_conf >= config.YOLO_HIGH_CONF_THRESHOLD:
+                chosen = best
+                chosen_conf = best_conf
+                new_id = _bid(best)
+                if new_id is not None and new_id != self.locked_track_id:
+                    logger.info(f"[YOLO] Visual lock acquired on track id {new_id} "
+                                f"(conf {best_conf:.2f}).")
+                self.locked_track_id = new_id
+                self.id_missing_frames = 0
+            elif self.high_conf_achieved or self.lock_hold_counter > 0:
+                chosen = best
+                chosen_conf = best_conf
+                if self.locked_track_id is None and _bid(best) is not None:
+                    self.locked_track_id = _bid(best)
 
-                    label = f"Drone: {yolo_conf_percent}%"
-                    
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    text_position = (x1, max(y1 - 10, 10)) 
-                    
-                    cv2.putText(frame, label, text_position, font, 0.6, (255, 255, 255), 2)
-                    # Lock onto the first (highest confidence) target
-                    break 
+        detected_this_frame = chosen is not None and (self.high_conf_achieved or self.lock_hold_counter > 0
+                                                      or chosen_conf >= config.YOLO_HIGH_CONF_THRESHOLD)
 
-        if not detected_this_frame:
+        if detected_this_frame:
+            if chosen_conf >= config.YOLO_HIGH_CONF_THRESHOLD:
+                self.high_conf_achieved = True
+                self.lock_hold_counter = hold_frames
+                self.lowconf_frames = 0
+            else:
+                self.lowconf_frames += 1
+
+            if self.lowconf_frames >= lowconf_ceiling:
+                logger.info(f"[YOLO] No detection >= {config.YOLO_HIGH_CONF_THRESHOLD:.2f} "
+                            f"for {self.lowconf_frames} frames - dropping visual lock (target degraded to noise).")
+                self._clear_visual_lock()
+                return frame
+
+            self.visual_lock = True
+            yolo_conf = chosen_conf
+            logger.info(f"[YOLO] Drone visually detected! Visual Confidence: {yolo_conf:.2f}")
+            x1, y1, x2, y2 = map(int, chosen.xyxy[0])
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            with self.error_lock:
+                self.error_x = center_x - (config.FRAME_WIDTH // 2)
+                self.error_y = center_y - (config.FRAME_HEIGHT // 2)
+            self.last_error_update = time.time()
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
+            cv2.putText(frame, f"Drone: {int(yolo_conf * 100)}%",
+                        (x1, max(y1 - 10, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        else:
             if self.lock_hold_counter > 0:
                 self.lock_hold_counter -= 1
-                self.visual_lock = True 
+                self.visual_lock = True
             else:
-                self.visual_lock = False
-                self.high_conf_achieved = False
-        
+                self._clear_visual_lock()
+
         return frame
+
     def _ptz_worker_loop(self):
         """
         Dedicated background thread to handle PTZ motor commands asynchronously.
@@ -196,14 +317,14 @@ class OpticalDetector:
 
         Also resends the last commanded velocity on every empty-queue tick
         (~10x/sec) whenever it's non-zero. This is what actually drives the
-        keep-alive: a long open-loop slew in handle_acoustic_search pushes a
-        command once and then blocks for up to ~20s without pushing again,
-        so without a periodic resend here the camera - many budget ONVIF PTZ
-        units auto-stop ContinuousMove a few seconds after the last command -
-        can silently stop moving while the FSM thread is still asleep,
-        counting on it. move_camera's own PTZ_KEEPALIVE_INTERVAL throttles
-        this down to one real HTTP call per second, so calling it this often
-        is cheap.
+        keep-alive: a long open-loop pan phase in the acoustic search commands
+        a speed once (in start_acoustic_search) and does not re-push it for up
+        to ~20s - step_acoustic_search only re-commands at phase boundaries -
+        so without a periodic resend here the camera (many budget ONVIF PTZ
+        units auto-stop ContinuousMove a few seconds after the last command)
+        can silently stop moving mid-slew. move_camera's own
+        PTZ_KEEPALIVE_INTERVAL throttles this down to one real HTTP call per
+        second, so calling it this often is cheap.
         """
         last_pan, last_tilt = 0.0, 0.0
         while self.ptz_worker_running:
@@ -233,7 +354,7 @@ class OpticalDetector:
         Dead-reckons current_camera_pan/current_tilt forward by the speed that
         was actually commanded during the last dt seconds. Mirrors the same
         PAN_MOVE_SPEED/TILT_MOVE_SPEED-referenced calibration (TIME_PER_DEGREE_PAN/TILT)
-        that handle_acoustic_search already uses for its open-loop moves, just
+        that the acoustic search uses for its open-loop moves, just
         generalized to the continuously-variable speed the PD controller in
         execute_visual_closed_loop produces - so current_camera_pan/current_tilt
         stay accurate even while closed-loop visual tracking is driving the
@@ -264,7 +385,13 @@ class OpticalDetector:
         # this tick before deciding on a new one.
         self._integrate_ptz_motion(dt)
 
-        if not self.visual_lock:
+        # Bound blind slewing: if the visual error hasn't been refreshed by a
+        # real box within VISUAL_ERROR_STALE_SECS (e.g. during a run_inference
+        # id-miss grace bridge, or the split second between losing the lock and
+        # the FSM leaving ENGAGED) hold position instead of driving on a stale
+        # target offset.
+        error_is_stale = (current_time - self.last_error_update) > getattr(config, 'VISUAL_ERROR_STALE_SECS', 0.5)
+        if not self.visual_lock or error_is_stale:
             self.track_target(0.0, 0.0)
             self.prev_error_x = 0.0
             self.prev_error_y = 0.0
@@ -331,308 +458,218 @@ class OpticalDetector:
         
         return direction, safe_target, degrees_to_move
     
-    def _sleep_and_check_lock(self, duration):
-        """
-        Sleeps for the specified duration in tiny increments.
-        This allows the system to instantly interrupt the movement if YOLO finds the drone.
-        Returns True if a visual lock was acquired during the sleep, False otherwise.
-        """
-        steps = int(duration / 0.1)
-        for _ in range(steps):
-            if self.visual_lock:
-                return True
-            time.sleep(0.1)
-            
-        # Sleep remaining fractional time
-        time.sleep(duration % 0.1)
-        return self.visual_lock
+    # ------------------------------------------------------------------
+    # Non-blocking acoustic search (replaces the blocking handle_acoustic_search)
+    # ------------------------------------------------------------------
+    # The FSM thread advances this ONE phase transition per 10Hz tick instead
+    # of blocking for up to ~25s inside a full pan slew + vertical macro-scan
+    # (which froze fresh-DOA intake, the TARGET_LOST_TIMEOUT timer and the
+    # watchdog). Phases: idle -> pan -> tilt_move -> tilt_stare -> done.
 
-    def handle_acoustic_search(self, target_azimuth):
-        """
-        Unified Phase 1 (Time-Based Open Loop): 
-        1. Slew horizontally (Pan) to the acoustic vector.
-        2. If target is not found during Pan, begin vertical sweep (Tilt).
-        Stops automatically the exact moment a visual lock is acquired.
-        """
+    def search_active(self):
+        return self._search_phase not in ("idle", "done")
+
+    def search_phase_name(self):
+        return self._search_phase
+
+    def search_recently_ran(self, azimuth):
+        """True if a full macro-scan aimed at ~this azimuth finished within the
+        last SEARCH_RESCAN_MIN_INTERVAL seconds - the FSM uses this to avoid a
+        tight re-sweep loop on a stationary acoustic target it can't see."""
+        interval = getattr(config, 'SEARCH_RESCAN_MIN_INTERVAL', 2.0)
+        if self._search_last_az is None:
+            return False
+        if time.time() - self._search_last_finished > interval:
+            return False
+        delta = abs((azimuth - self._search_last_az + 180.0) % 360.0 - 180.0)
+        return delta < config.DOA_MAX_JUMP_DEG
+
+    def start_acoustic_search(self, target_azimuth):
+        """Begin a non-blocking acoustic search. Advanced one phase per FSM
+        tick by step_acoustic_search()."""
         if self.ptz is None:
+            self._search_phase = "done"
+            self._search_result = "exhausted"
             return
 
-        # ==========================================
-        # STEP 1: HORIZONTAL PAN TO TARGET DOA
-        # ==========================================
-        direction, safe_target, degrees_to_move = self.calculate_pan_movement(target_azimuth)
+        now = time.time()
+        self._search_target_az = target_azimuth
+        self._search_last_az = target_azimuth
+        self._search_result = None
+        self._search_tilt_idx = 0
 
-        if abs(degrees_to_move) >= 2.0 and direction != "None":
-            logger.info(f"[Optical] Slew {direction} by {degrees_to_move:.1f} degrees (Target: {safe_target})...")
-            
-            # Invert X axis based on hardware specifics (Right is negative)
-            x_speed = -config.PAN_MOVE_SPEED if direction == "Right" else config.PAN_MOVE_SPEED
-            # Start pan motor
-            self.track_target(x_speed, 0.0)
-            sleep_time = degrees_to_move * config.TIME_PER_DEGREE_PAN
-
-            # Wait for movement to finish, BUT abort if YOLO sees the drone
-            start_time = time.time()
-            target_found_during_pan = self._sleep_and_check_lock(sleep_time)
-            elapsed_time = time.time() - start_time
-            
-            # Stop motor and update software position state
-            self.track_target(0.0, 0.0)
-            if target_found_during_pan and sleep_time > 0:
-                fraction = min(1.0, elapsed_time / sleep_time)
-                actual_moved = degrees_to_move * fraction
-
-                if direction == "Right":
-                    self.current_camera_pan -= actual_moved
-                else:
-                    self.current_camera_pan += actual_moved
-            else:
-                self.current_camera_pan = safe_target            
-
-            if target_found_during_pan:
-                logger.info(f"[Optical] Target detected during PAN! Stopped at ~{self.current_camera_pan:.1f}°")
-                return
-
-        # If we already see the target, no need to tilt scan
         if self.visual_lock:
+            self._search_phase = "done"
+            self._search_result = "acquired"
+            self._search_last_finished = now
             return
 
-        # ==========================================
-        # STEP 2: VERTICAL MACRO-SCAN
-        # ==========================================
-        # Assuming an effective vertical FOV of ~45 degrees.
-        # We only need 3 stops to cover from 0 to 90 degrees.
-        
-        logger.info("[Optical] Initiating Optimized Vertical Macro-Scan...")
+        direction, safe_target, degrees_to_move = self.calculate_pan_movement(target_azimuth)
+        if abs(degrees_to_move) >= 2.0 and direction != "None":
+            logger.info(f"[Optical] Slew {direction} by {degrees_to_move:.1f} degrees "
+                        f"(Target: {safe_target:.1f})...")
+            self._search_pan_dir = direction
+            self._search_pan_target = safe_target
+            self._search_pan_from = self.current_camera_pan
+            self._search_pan_degs = degrees_to_move
+            self._search_phase = "pan"
+            self._search_phase_started = now
+            self._search_phase_deadline = now + degrees_to_move * config.TIME_PER_DEGREE_PAN
+            x_speed = -config.PAN_MOVE_SPEED if direction == "Right" else config.PAN_MOVE_SPEED
+            self.track_target(x_speed, 0.0)
+        else:
+            logger.info("[Optical] Initiating Optimized Vertical Macro-Scan...")
+            self._begin_tilt_phase(now)
 
-        for target_tilt in config.TILT_CHECKPOINTS:
-            if self.visual_lock:
-                break
-                
-            current_tilt_val = getattr(self, 'current_tilt', config.MIN_TILT)
-            tilt_diff = target_tilt - current_tilt_val
-            
+    def _begin_tilt_phase(self, now):
+        """Advance to the next TILT_CHECKPOINTS entry that needs a move (or a
+        stare if we're already there); finish the search once they're used up."""
+        checkpoints = config.TILT_CHECKPOINTS
+        while self._search_tilt_idx < len(checkpoints):
+            target_tilt = float(checkpoints[self._search_tilt_idx])
+            tilt_diff = target_tilt - self.current_tilt
             if abs(tilt_diff) >= 2.0:
-                logger.info(f"[Optical] Macro-Slewing TILT to {target_tilt}°...")
-                y_speed = (config.TILT_MOVE_SPEED if tilt_diff > 0 else -config.TILT_MOVE_SPEED) * config.TILT_DIRECTION_INVERSION
-                time_to_tilt = abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
-                
-                # --- 1. MOVE (Fast Slew) ---
+                logger.info(f"[Optical] Macro-Slewing TILT to {target_tilt:.1f}°...")
+                y_speed = ((config.TILT_MOVE_SPEED if tilt_diff > 0 else -config.TILT_MOVE_SPEED)
+                           * config.TILT_DIRECTION_INVERSION)
+                self._search_tilt_target = target_tilt
+                self._search_tilt_from = self.current_tilt
+                self._search_tilt_degs = abs(tilt_diff)
+                self._search_phase = "tilt_move"
+                self._search_phase_started = now
+                self._search_phase_deadline = now + abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
                 self.track_target(0.0, y_speed)
-                
-                # Sleep mostly blind, but keep a tiny chance to catch it mid-flight
-                start_time = time.time()
-                target_found_during_move = self._sleep_and_check_lock(time_to_tilt)
-                elapsed_time = time.time() - start_time
-                self.track_target(0.0, 0.0)
-
-                if target_found_during_move and time_to_tilt > 0:
-                    fraction = min(1.0, elapsed_time / time_to_tilt)
-                    actual_moved_tilt = abs(tilt_diff) * fraction
-                    if tilt_diff > 0:
-                        self.current_tilt += actual_moved_tilt
-                    else:
-                        self.current_tilt -= actual_moved_tilt
-                else:
-                    self.current_tilt = target_tilt
-                
-                if target_found_during_move:
-                    logger.info(f"[Optical] Target acquired during macro-slew to {self.current_tilt:.1f}°")
-                    break
-
-            # --- 2. STARE (Settle and Detect) ---
-            logger.info(f"[Optical] Camera stationary at {target_tilt}°. Flushing buffer and staring...")
-            # 0.8 seconds is usually enough to flush the RTSP buffer and stabilize Autofocus.
-            # During this time, we constantly ask YOLO "do you see it now?".
-            target_found = self._sleep_and_check_lock(0.8) 
-            
-            if target_found:
-                logger.info(f"*** TARGET VISUALLY ACQUIRED at ~{self.current_tilt}°! ***")
-                break
-
-    def return_to_default_elevation(self):
-        """
-        Re-centers TILT to DEFAULT_ELEVATION_ANGLE. Meant to be called once a
-        search is given up on (FSM reverting TRACKING -> SCANNING). Without
-        this, a session that ends mid vertical-macro-scan (parked at a
-        TILT_CHECKPOINTS extreme like 55 deg/15 deg) or right after ENGAGED's
-        closed-loop PD tracking (parked at whatever arbitrary angle the
-        target was last at) leaves the camera sitting there indefinitely,
-        since SCANNING itself never touches tilt.
-        """
-        target_tilt = config.DEFAULT_ELEVATION_ANGLE
-        tilt_diff = target_tilt - self.current_tilt
-        if abs(tilt_diff) < 2.0:
+                return
+            logger.info(f"[Optical] Camera stationary at {target_tilt:.1f}°. Flushing buffer and staring...")
+            self._search_tilt_target = target_tilt
+            self._search_phase = "tilt_stare"
+            self._search_phase_started = now
+            self._search_phase_deadline = now + getattr(config, 'SEARCH_TILT_STARE_SECS', 0.8)
+            self.track_target(0.0, 0.0)
             return
-
-        logger.info(f"[Optical] Returning TILT to default elevation ({target_tilt}°)...")
-        y_speed = (config.TILT_MOVE_SPEED if tilt_diff > 0 else -config.TILT_MOVE_SPEED) * config.TILT_DIRECTION_INVERSION
-        time_to_tilt = abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
-
-        self.track_target(0.0, y_speed)
-        target_found_during_move = self._sleep_and_check_lock(time_to_tilt)
+        self._search_phase = "done"
+        self._search_result = "exhausted"
+        self._search_last_finished = time.time()
         self.track_target(0.0, 0.0)
-        self.current_tilt = target_tilt
 
-        if target_found_during_move:
-            logger.info(f"[Optical] Target reacquired while returning to default elevation at ~{self.current_tilt:.1f}°")
+    def step_acoustic_search(self, fresh_azimuth):
+        """Advance the search by at most one phase transition. Returns
+        'running' | 'acquired' | 'exhausted'. Never blocks."""
+        phase = self._search_phase
+        if phase in ("idle", "done"):
+            return self._search_result or "exhausted"
 
-        # old version of tracking the drone after YOLO detection
-        # def execute_visual_closed_loop(self): 
-        #     """
-        #     Phase 2: Visual Tracking - Zoned Control with Deadband for ONVIF Optimization.
-        #     This approach drastically reduces network spam by sending discrete speed commands
-        #     only when the target crosses specific bounding zones.
-        #     """
-        #     if self.ptz is None: 
-        #         return
-    
-        #     if not self.visual_lock:
-        #         self.track_target(0.0, 0.0)  # Stop motors if no visual lock
-        #         return
-            
-        #     # 1. Define the Deadzone - The target is centered enough, do not move the motors.
-        #     # This prevents micro-jitters when the drone is hovering in the center.
-        #     deadzone_x = config.FRAME_WIDTH * 0.15  # ~96 pixels from the center horizontally
-        #     deadzone_y = config.FRAME_HEIGHT * 0.15 # ~72 pixels from the center vertically
-            
-        #     # 2. Define tered motor speeds (Gears)
-        #     fast_speed = 0.8 # Maximum speed for when the target is escaping the frame edge
-        #     smooth_speed = 0.4 # Slower, smooth speed for normal tracking (can be tuned)
-            
-        #     pan_speed = 0.0
-        #     tilt_speed = 0.0
-            
-        #     # --- X-Axis (Pan) Logic ---
-        #     abs_error_x = abs(self.error_x)
-        #     if abs_error_x > deadzone_x:
-        #         # If the target is near the extreme edges of the screen -> go fast. Otherwise -> smooth.
-        #         if abs_error_x > (config.FRAME_WIDTH * 0.35):
-        #             base_pan = fast_speed
-        #         else:
-        #             base_pan = smooth_speed
-                
-        #         # Apply direction based on your specific camera hardware calibration.
-        #         # If error_x > 0, the target is on the right side of the screen.
-        #         # Note: Right movement is negative (-) based on previous physical tests.
-        #         pan_speed = -base_pan if self.error_x > 0 else base_pan
-    
-        #     # --- Y-Axis (Tilt) Logic ---
-        #     abs_error_y = abs(self.error_y)
-        #     if abs_error_y > deadzone_y:
-        #         if abs_error_y > (config.FRAME_HEIGHT * 0.35):
-        #             base_tilt = fast_speed
-        #         else:
-        #             base_tilt = smooth_speed
-                
-        #         # If error_y > 0, the target is in the lower part of the screen, so we move down.
-        #         # TILT_DIRECTION_INVERSION from config handles upside-down ceiling installations.
-        #         raw_tilt_speed = base_tilt if self.error_y > 0 else -base_tilt
-        #         tilt_speed = raw_tilt_speed * config.TILT_DIRECTION_INVERSION
-    
-        #     # 3. Dispatch the command!
-        #     # Thanks to the state-caching mechanism in camera_AC.py, an actual HTTP/SOAP request 
-        #     # is ONLY sent over the network if the calculated speeds have physically changed.
-        #     self.track_target(pan_speed, tilt_speed)
+        now = time.time()
 
-        # fix elevation
-        # # ==========================================
-        # # STEP 2: MOVE TILT TO FIXED MIDDLE ELEVATION
-        # # ==========================================
-        # # Target angle: DEFAULT_ELEVATION_ANGLE or midpoint between MIN_TILT and MAX_TILT
-        # target_tilt = getattr(config, 'DEFAULT_ELEVATION_ANGLE', (config.MIN_TILT + config.MAX_TILT) / 2.0)
-        # current_tilt_val = getattr(self, 'current_tilt', config.MIN_TILT)
-        # tilt_diff = target_tilt - current_tilt_val
+        if self.visual_lock:
+            self._finalize_partial_motion(now)
+            self.track_target(0.0, 0.0)
+            self._search_phase = "done"
+            self._search_result = "acquired"
+            self._search_last_finished = now
+            logger.info(f"*** TARGET VISUALLY ACQUIRED during {phase} at "
+                        f"~pan {self.current_camera_pan:.1f}° / tilt {self.current_tilt:.1f}° ***")
+            return "acquired"
 
-        # if abs(tilt_diff) >= 2.0:
-        #     logger.info(f"[Optical] Moving TILT to fixed middle elevation ({target_tilt}°)...")
-            
-        #     y_speed = config.MOVE_SPEED if tilt_diff > 0 else -config.MOVE_SPEED
-        #     time_to_tilt = abs(tilt_diff) * config.TIME_PER_DEGREE_TILT
+        if phase == "pan":
+            replan = getattr(config, 'SEARCH_PAN_REPLAN_DEG', 0.0)
+            if replan > 0.0:
+                drift = abs((fresh_azimuth - self._search_target_az + 180.0) % 360.0 - 180.0)
+                if drift > replan:
+                    self._finalize_partial_motion(now)
+                    logger.info(f"[Optical] DOA shifted {drift:.0f}° mid-slew - re-planning pan.")
+                    self.start_acoustic_search(fresh_azimuth)
+                    return "running"
+            if now >= self._search_phase_deadline:
+                self.track_target(0.0, 0.0)
+                self.current_camera_pan = max(config.MIN_ANGLE,
+                                              min(config.MAX_ANGLE, self._search_pan_target))
+                logger.info("[Optical] Initiating Optimized Vertical Macro-Scan...")
+                self._begin_tilt_phase(now)
+            return "running"
 
-        #     # Start Tilt motor directly to the center angle
-        #     self.track_target(0.0, y_speed)
-        #     target_found_during_tilt = self._sleep_and_check_lock(time_to_tilt)
+        if phase == "tilt_move":
+            if now >= self._search_phase_deadline:
+                self.track_target(0.0, 0.0)
+                self.current_tilt = max(config.MIN_TILT, min(config.MAX_TILT, self._search_tilt_target))
+                logger.info(f"[Optical] Camera stationary at {self.current_tilt:.1f}°. "
+                            f"Flushing buffer and staring...")
+                self._search_phase = "tilt_stare"
+                self._search_phase_started = now
+                self._search_phase_deadline = now + getattr(config, 'SEARCH_TILT_STARE_SECS', 0.8)
+            return "running"
 
-        #     self.track_target(0.0, 0.0)
-        #     self.current_tilt = target_tilt
+        if phase == "tilt_stare":
+            if now >= self._search_phase_deadline:
+                self._search_tilt_idx += 1
+                self._begin_tilt_phase(now)
+            return "running"
 
-        #     if target_found_during_tilt:
-        #         logger.info("[Optical] Target detected while moving Tilt to center!")
-        #         return
+        return "running"
 
-        # # ==========================================
-        # # STEP 3: STATIONARY STARE (VERIFY YOLO DETECTION)
-        # # ==========================================
-        # logger.info(f"[Optical] Camera stationary at Pan: {safe_target}°, Tilt: {target_tilt}°. Waiting for YOLO lock...")
-        # self.track_target(0.0, 0.0)
+    def _finalize_partial_motion(self, now):
+        """A moving phase was cut short (visual lock / DOA re-plan / abort):
+        dead-reckon how far the axis actually travelled before it is stopped."""
+        phase = self._search_phase
+        if phase == "pan":
+            span = max(1e-6, self._search_phase_deadline - self._search_phase_started)
+            frac = min(1.0, max(0.0, (now - self._search_phase_started) / span))
+            moved = self._search_pan_degs * frac
+            pan = (self._search_pan_from - moved if self._search_pan_dir == "Right"
+                   else self._search_pan_from + moved)
+            self.current_camera_pan = max(config.MIN_ANGLE, min(config.MAX_ANGLE, pan))
+        elif phase == "tilt_move":
+            span = max(1e-6, self._search_phase_deadline - self._search_phase_started)
+            frac = min(1.0, max(0.0, (now - self._search_phase_started) / span))
+            moved = self._search_tilt_degs * frac
+            tilt = (self._search_tilt_from + moved if self._search_tilt_target >= self._search_tilt_from
+                    else self._search_tilt_from - moved)
+            self.current_tilt = max(config.MIN_TILT, min(config.MAX_TILT, tilt))
 
-        # # Stand completely still for 1.5 seconds to let focus & GStreamer buffer settle, checking YOLO continuously
-        # target_acquired = self._sleep_and_check_lock(1.5)
+    def abort_acoustic_search(self):
+        """Stop any in-progress search and halt the motors. Called by the FSM
+        on every exit from TRACKING (lock acquired / timeout / grace-hold)."""
+        if self.search_active():
+            self._finalize_partial_motion(time.time())
+        self._search_phase = "idle"
+        self._search_result = None
+        self.track_target(0.0, 0.0)
 
-        # if target_acquired:
-        #     logger.info("*** TARGET VISUALLY ACQUIRED BY YOLO! ***")
-        # else:
-        #     logger.info("[Optical] Stationary check finished - No visual lock acquired.")
+    # ------------------------------------------------------------------
+    # Non-blocking tilt-home (replaces the blocking return_to_default_elevation)
+    # ------------------------------------------------------------------
+    def start_tilt_home(self):
+        """Begin returning TILT to DEFAULT_ELEVATION_ANGLE. Stepped by
+        step_tilt_home() from the FSM SCANNING state."""
+        if self.ptz is None:
+            self._tilt_home_phase = "idle"
+            return
+        target = config.DEFAULT_ELEVATION_ANGLE
+        diff = target - self.current_tilt
+        if abs(diff) < 2.0:
+            self._tilt_home_phase = "idle"
+            return
+        logger.info(f"[Optical] Returning TILT to default elevation ({target}°)...")
+        y_speed = ((config.TILT_MOVE_SPEED if diff > 0 else -config.TILT_MOVE_SPEED)
+                   * config.TILT_DIRECTION_INVERSION)
+        self._tilt_home_target = target
+        self._tilt_home_deadline = time.time() + abs(diff) * config.TIME_PER_DEGREE_TILT
+        self._tilt_home_phase = "moving"
+        self.track_target(0.0, y_speed)
 
+    def step_tilt_home(self):
+        """Returns True while still moving, False when done/idle."""
+        if self._tilt_home_phase != "moving":
+            return False
+        if self.visual_lock or time.time() >= self._tilt_home_deadline:
+            self.track_target(0.0, 0.0)
+            if self.visual_lock:
+                logger.info("[Optical] Target reacquired while returning to default elevation.")
+            else:
+                self.current_tilt = self._tilt_home_target
+            self._tilt_home_phase = "idle"
+            return False
+        return True
 
-        #old version works good but is slow and can miss the target if it flies away during the tilt scan
-        # # ==========================================
-        # # STEP 2: VERTICAL SCAN (TILT SWEEP)
-        # # ==========================================
-        # logger.info("[Optical] Initiating Vertical Scan...")
-        # current_tilt = config.MIN_TILT
-        # scan_step = 20.0
-        # direction_tilt = "Up"
-        # time_per_step = scan_step * config.TIME_PER_DEGREE_TILT
-
-        # # 2A. Reset Tilt to the bottom limit before scanning
-        # logger.info("[Optical] Resetting tilt to bottom limit...")
-        # self.track_target(0.0, -config.MOVE_SPEED) # Send motor DOWN
-        
-        # if self._sleep_and_check_lock(config.TILT_TIME_END_TO_END):
-        #     self.track_target(0.0, 0.0)
-        #     logger.info("[Optical] Target detected while resetting tilt!")
-        #     return
-        # self.track_target(0.0, 0.0)
-
-        # # 2B. Execute step-by-step vertical scan
-        # # Limited to 20 sweeps to prevent infinite loop if drone flies away
-        # max_scan_sweeps = 5
-        # for _ in range(max_scan_sweeps):
-        #     # Pre-check visual lock
-        #     if self.visual_lock:
-        #         break
-                
-        #     logger.info(f"[Optical] Scanning at {current_tilt} degrees...")
-            
-        #     # Determine motor direction for this step
-        #     y_speed = config.MOVE_SPEED if direction_tilt == "Up" else -config.MOVE_SPEED
-            
-        #     # Start tilt motor
-        #     self.track_target(0.0, y_speed)
-            
-        #     # Wait for step to finish, abort immediately if YOLO sees the drone
-        #     target_found = self._sleep_and_check_lock(time_per_step)
-        #     self.track_target(0.0, 0.0)
-            
-        #     if target_found:
-        #         logger.info(f"*** TARGET VISUALLY ACQUIRED at ~{current_tilt} degrees! ***")
-        #         break
-                
-        #     # Update math for next step
-        #     if direction_tilt == "Up":
-        #         current_tilt += scan_step
-        #     else:
-        #         current_tilt -= scan_step
-                
-        #     # Change direction at bounds (Bounce effect)
-        #     if current_tilt >= config.MAX_TILT:
-        #         direction_tilt = "Down"
-        #         current_tilt = config.MAX_TILT
-        #     elif current_tilt <= config.MIN_TILT:
-        #         direction_tilt = "Up"
-        #         current_tilt = config.MIN_TILT
-                
-        # # Ensure motor is stopped when scan finishes or aborts
-        # # self.track_target(0.0, 0.0)
+    def tilt_home_active(self):
+        return self._tilt_home_phase == "moving"
