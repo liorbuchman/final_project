@@ -103,18 +103,86 @@ const SLIDER_DEFS = [
     tip: "Probability cutoff for the Audio CNN classifier to trigger an acoustic detection alarm." },
 ];
 
+// Single shared AudioContext. Browsers start it "suspended" until the first
+// real user gesture on the page, and cap the number of live contexts (~6), so
+// creating a fresh one per beep() silently stopped producing sound after the
+// page had been idle. One context, resumed on the first click/keydown anywhere.
+let _audioCtx = null;
+function getAudioCtx() {
+  if (!_audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    _audioCtx = new AC();
+  }
+  if (_audioCtx.state === "suspended") _audioCtx.resume();
+  return _audioCtx;
+}
+if (typeof window !== "undefined") {
+  const _unlock = () => { getAudioCtx(); };
+  window.addEventListener("click", _unlock);
+  window.addEventListener("keydown", _unlock);
+  // Chrome populates getVoices() asynchronously - poke it so the first alert
+  // isn't beep-only just because the voice list hadn't loaded yet.
+  try {
+    if (window.speechSynthesis) {
+      window.speechSynthesis.getVoices();
+      window.speechSynthesis.onvoiceschanged = () => { window.speechSynthesis.getVoices(); };
+    }
+  } catch (e) { /* no speechSynthesis */ }
+}
+
 function beep() {
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = getAudioCtx();
+    if (!ctx) return;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.type = "square"; osc.frequency.value = 880;
     gain.gain.value = 0.15;
     osc.connect(gain); gain.connect(ctx.destination);
     osc.start();
-    setTimeout(() => { osc.stop(); ctx.close(); }, 250);
+    setTimeout(() => { try { osc.stop(); } catch (e) {} }, 250);
   } catch (e) { /* audio not available */ }
 }
+
+// Spoken "Drone detected!" alert. Prefers the en-US "Microsoft David" voice,
+// falls back to any en-* voice, then the browser default. If speechSynthesis
+// is unavailable or has no voices (e.g. a stripped browser on the Jetson),
+// speak() is a no-op and the caller is left with just the beep().
+function pickVoice() {
+  try {
+    const voices = window.speechSynthesis.getVoices() || [];
+    if (!voices.length) return undefined;
+    return voices.find(v => /david/i.test(v.name) && /^en[-_]us/i.test(v.lang))
+        || voices.find(v => /^en[-_]/i.test(v.lang))
+        || undefined;
+  } catch (e) { return undefined; }
+}
+function speak(text) {
+  try {
+    if (!(window.speechSynthesis && window.SpeechSynthesisUtterance)) return false;
+    if (!(window.speechSynthesis.getVoices() || []).length) return false;
+    const u = new SpeechSynthesisUtterance(text);
+    const v = pickVoice();
+    if (v) u.voice = v;
+    u.rate = 1.0; u.pitch = 1.0; u.volume = 1.0;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+    return true;
+  } catch (e) { return false; }
+}
+
+// The full ENGAGED alert: attention beep, then the spoken phrase ~320ms later
+// (so the tone doesn't step on the first word). speak() no-ops gracefully when
+// TTS is unavailable, leaving just the beep.
+function droneAlert() {
+  beep();
+  setTimeout(() => speak("Drone detected!"), 320);
+}
+// Minimum gap between alerts within one uninterrupted ENGAGED run. A drop back
+// to SEARCHING/IDLE re-arms immediately and resets this (see the telemetry
+// handler), so a genuine re-acquisition is never delayed by it.
+const ALARM_MIN_INTERVAL_MS = 10000;
 
 function fmt(n, d = 1) {
   if (n === null || n === undefined || Number.isNaN(n)) return "N/A";
@@ -286,6 +354,12 @@ function App() {
   const wsRef = useRef(null);
   const backoffRef = useRef(1000);
   const prevStateRef = useRef("IDLE");
+  // ENGAGED audio alert gating. armed=true means the next entry into ENGAGED
+  // should alert. It is cleared right after an alert and only re-armed when the
+  // FSM falls all the way back to SEARCHING/IDLE (full target loss) - so an
+  // ENGAGED->TRACKING->ENGAGED flap does not re-trigger it.
+  const alarmArmedRef = useRef(true);
+  const lastAlarmAtRef = useRef(0);
   const spectroCanvasRef = useRef(null);
   const waveChartRef = useRef(null);
   const waveCanvasRef = useRef(null);
@@ -342,7 +416,18 @@ function App() {
             setAcousticNoiseCount(msg.acoustic_recording.noise_count || 0);
             if (msg.acoustic_recording.max_samples) setAcousticMaxSamples(msg.acoustic_recording.max_samples);
           }
-          if (msg.state === "ENGAGED" && prevStateRef.current !== "ENGAGED" && !alarmMuted) beep();
+          if (msg.state === "SEARCHING" || msg.state === "IDLE") {
+            // Full target loss - re-arm and drop the min-interval guard so a
+            // fresh acquisition alerts immediately.
+            alarmArmedRef.current = true;
+            lastAlarmAtRef.current = 0;
+          }
+          if (msg.state === "ENGAGED" && prevStateRef.current !== "ENGAGED" && !alarmMuted
+              && alarmArmedRef.current && (Date.now() - lastAlarmAtRef.current) >= ALARM_MIN_INTERVAL_MS) {
+            droneAlert();
+            alarmArmedRef.current = false;
+            lastAlarmAtRef.current = Date.now();
+          }
           prevStateRef.current = msg.state;
           updateWaveform(msg.waveform);
           break;
