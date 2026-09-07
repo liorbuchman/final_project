@@ -21,7 +21,7 @@
 
   .led-idle { background:#6b7280; }
   .led-calibrating { background:#a855f7; animation: breathe 1.4s ease-in-out infinite; }
-  .led-searching { background:#3b82f6; animation: breathe 2s ease-in-out infinite; }
+  .led-scanning { background:#3b82f6; animation: breathe 2s ease-in-out infinite; }
   .led-slewing { background:#eab308; }
   .led-tracking { background:#f97316; animation: blink2hz .5s steps(1,end) infinite; }
   .led-engaged { background:#ef4444; animation: pulseFast .3s ease-in-out infinite; }
@@ -82,7 +82,7 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 const STATE_COLORS = {
-  IDLE: "led-idle", CALIBRATING: "led-calibrating", SEARCHING: "led-searching", SLEWING: "led-slewing",
+  IDLE: "led-idle", CALIBRATING: "led-calibrating", SCANNING: "led-scanning", SLEWING: "led-slewing",
   TRACKING: "led-tracking", ENGAGED: "led-engaged", DEGRADED: "led-degraded",
 };
 
@@ -180,7 +180,7 @@ function droneAlert() {
   setTimeout(() => speak("Drone detected!"), 320);
 }
 // Minimum gap between alerts within one uninterrupted ENGAGED run. A drop back
-// to SEARCHING/IDLE re-arms immediately and resets this (see the telemetry
+// to SCANNING/IDLE re-arms immediately and resets this (see the telemetry
 // handler), so a genuine re-acquisition is never delayed by it.
 const ALARM_MIN_INTERVAL_MS = 10000;
 
@@ -356,7 +356,7 @@ function App() {
   const prevStateRef = useRef("IDLE");
   // ENGAGED audio alert gating. armed=true means the next entry into ENGAGED
   // should alert. It is cleared right after an alert and only re-armed when the
-  // FSM falls all the way back to SEARCHING/IDLE (full target loss) - so an
+  // FSM falls all the way back to SCANNING/IDLE (full target loss) - so an
   // ENGAGED->TRACKING->ENGAGED flap does not re-trigger it.
   const alarmArmedRef = useRef(true);
   const lastAlarmAtRef = useRef(0);
@@ -416,7 +416,7 @@ function App() {
             setAcousticNoiseCount(msg.acoustic_recording.noise_count || 0);
             if (msg.acoustic_recording.max_samples) setAcousticMaxSamples(msg.acoustic_recording.max_samples);
           }
-          if (msg.state === "SEARCHING" || msg.state === "IDLE") {
+          if (msg.state === "SCANNING" || msg.state === "IDLE") {
             // Full target loss - re-arm and drop the min-interval guard so a
             // fresh acquisition alerts immediately.
             alarmArmedRef.current = true;

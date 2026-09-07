@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manual Vision Test Console</title>
+<!--
+  Separate engineering console - NOT the operational dashboard.
+
+  Purpose: exercise the vision pipeline on demand without a real acoustic
+  detection. The operator types a PAN azimuth; the backend
+  (hardware_bridge.set_manual_vision_test) substitutes that angle for the
+  acoustic trigger the FSM consumes, so the system does its full normal
+  sequence: slew PAN to the typed angle -> TILT macro-scan -> YOLO runs
+  throughout TRACKING -> visual lock => ENGAGED + closed-loop track (angle
+  updated by motion, exactly as today) -> if nothing is seen, after the
+  configured TARGET_LOST_TIMEOUT it returns to SCANNING and waits for the
+  next typed angle.
+
+  While engaged, real acoustic triggers are suppressed - the typed angle is
+  the only thing that moves the camera. This is a deliberate, temporary mode;
+  press Release to restore normal acoustic behaviour. Requires the backend to
+  be running with HARDWARE_MODE=1.
+
+  Same stack as index.html: no build step, plain JS, MJPEG video decoded
+  client-side off /video_feed. Talks to the same /ws as the operational
+  dashboard (telemetry read-only; one extra command: manual_vision_test).
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; color: #e5e7eb;
+    font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; overflow: hidden; }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  .shell { display: flex; flex-direction: column; height: 100vh; }
+
+  header { display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+    background: #14171c; border-bottom: 1px solid #262b33; flex-shrink: 0; flex-wrap: wrap; }
+  header h1 { font-size: 0.95rem; margin: 0; font-weight: 700; letter-spacing: 0.02em; }
+  .state-pill { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: #6b7280; display: inline-block; }
+  .dot[data-s="SCANNING"] { background: #3b82f6; }
+  .dot[data-s="SEARCHING"] { background: #3b82f6; }
+  .dot[data-s="TRACKING"] { background: #f97316; }
+  .dot[data-s="ENGAGED"] { background: #ef4444; }
+  .dot[data-s="DEGRADED"] { background: #dc2626; }
+  .dot[data-s="CALIBRATING"] { background: #a855f7; }
+  .badge { margin-left: 4px; background: #b91c1c; color: #fff; font-weight: 800;
+    letter-spacing: 0.08em; font-size: 0.7rem; padding: 3px 8px; border-radius: 4px; }
+  .link { margin-left: auto; font-size: 0.8rem; }
+  .link.ok { color: #34d399; }
+  .link.bad { color: #f87171; }
+
+  main { flex: 1 1 auto; min-height: 0; display: flex; gap: 12px; padding: 12px; overflow: hidden; }
+  .video-wrap { flex: 1 1 auto; min-width: 0; background: #000; border: 1px solid #262b33;
+    border-radius: 8px; position: relative; display: flex; align-items: center; justify-content: center; }
+  .video-wrap canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .no-signal { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #6b7280; font-family: monospace; font-size: 1.4rem; }
+
+  .panel { width: 320px; flex-shrink: 0; background: #14171c; border: 1px solid #262b33;
+    border-radius: 8px; padding: 16px; overflow-y: auto; }
+  .panel h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em;
+    color: #9ca3af; margin: 0 0 12px; }
+  label { display: block; font-size: 0.8rem; color: #9ca3af; margin-bottom: 4px; }
+  input[type="number"] { width: 100%; background: #0b0d10; border: 1px solid #3a4048; color: #e5e7eb;
+    border-radius: 6px; padding: 8px 10px; font-size: 1.1rem; font-variant-numeric: tabular-nums; }
+  .range-hint { font-size: 0.72rem; color: #6b7280; margin: 6px 0 14px; }
+  .btn-row { display: flex; gap: 8px; }
+  button { flex: 1; border: 0; border-radius: 6px; padding: 10px 12px; font-weight: 700;
+    font-size: 0.85rem; cursor: pointer; color: #fff; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #engage { background: #15803d; }
+  #release { background: #4b5563; }
+  .hint { font-size: 0.78rem; color: #cbd5e1; margin: 14px 0 0; min-height: 2.6em; }
+
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 18px 0 0;
+    padding-top: 14px; border-top: 1px solid #262b33; font-size: 0.82rem; }
+  dt { color: #9ca3af; }
+  dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <h1>Manual Vision Test</h1>
+    <span class="state-pill"><span class="dot" id="dot"></span><span id="state">—</span></span>
+    <span class="badge" id="badge" hidden>MANUAL TEST</span>
+    <span class="link bad" id="link">connecting…</span>
+  </header>
+
+  <main>
+    <div class="video-wrap">
+      <canvas id="video" width="1280" height="720"></canvas>
+      <div class="no-signal" id="nosignal">NO SIGNAL</div>
+    </div>
+
+    <div class="panel">
+      <h2>Operator PAN azimuth</h2>
+      <label for="angle">Target angle (degrees)</label>
+      <input type="number" id="angle" step="1" value="0">
+      <div class="range-hint">mechanical range: <span id="range" class="tnum">—</span></div>
+
+      <div class="btn-row">
+        <button id="engage" disabled>Engage</button>
+        <button id="release" disabled>Release</button>
+      </div>
+
+      <p class="hint" id="hint">Connecting to the system…</p>
+
+      <dl>
+        <dt>Mode</dt><dd id="mstatus">—</dd>
+        <dt>Camera pan</dt><dd id="pan">—</dd>
+        <dt>Acoustic conf.</dt><dd id="aconf">—</dd>
+        <dt>Visual conf.</dt><dd id="vconf">—</dd>
+      </dl>
+    </div>
+  </main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (s) { return document.querySelector(s); };
+
+  var panMin = -175, panMax = 175, rangeKnown = false;
+  var lastState = null;
+  var manual = { available: false, enabled: false, pending: false, pan_deg: 0 };
+
+  // ---- WebSocket (same /ws as the operational dashboard) --------------------
+  var ws = null, backoff = 1000;
+
+  function connect() {
+    var proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(proto + "://" + location.host + "/ws");
+    ws.onopen = function () {
+      backoff = 1000;
+      $("#link").textContent = "connected";
+      $("#link").className = "link ok";
+    };
+    ws.onclose = function () {
+      $("#link").textContent = "reconnecting…";
+      $("#link").className = "link bad";
+      setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 10000);
+    };
+    ws.onerror = function () { try { ws.close(); } catch (e) {} };
+    ws.onmessage = function (evt) {
+      var m;
+      try { m = JSON.parse(evt.data); } catch (e) { return; }
+      if (m.type === "telemetry") onTelemetry(m);
+      else if (m.type === "camera_range") onRange(m);
+      else if (m.type === "manual_test") { manual = m; render(); }
+    };
+  }
+
+  function onRange(m) {
+    if (typeof m.min_deg === "number") panMin = m.min_deg;
+    if (typeof m.max_deg === "number") panMax = m.max_deg;
+    rangeKnown = true;
+    var a = $("#angle");
+    a.min = panMin; a.max = panMax;
+    $("#range").textContent = panMin + "°  …  " + panMax + "°";
+    render();
+  }
+
+  function onTelemetry(m) {
+    lastState = m.state || "—";
+    $("#state").textContent = lastState;
+    $("#dot").setAttribute("data-s", lastState);
+    $("#pan").textContent = fmtDeg(m.camera_pan_deg);
+    $("#aconf").textContent = pct(m.acoustic && m.acoustic.confidence);
+    $("#vconf").textContent = pct(m.vision && m.vision.confidence);
+    if (m.manual_test) manual = m.manual_test;
+    render();
+  }
+
+  function pct(x) { return (x === null || x === undefined) ? "—" : Math.round(x * 100) + "%"; }
+  function fmtDeg(x) { return (x === null || x === undefined) ? "—" : (Math.round(x * 10) / 10) + "°"; }
+  // The idle/acoustic-search state is "SCANNING" in the FSM enum but is
+  // surfaced to the frontend as "SEARCHING" by hardware_bridge's name map -
+  // accept either so this console works whichever vocabulary telemetry uses.
+  function isIdleState(s) { return s === "SCANNING" || s === "SEARCHING"; }
+
+  // ---- Render -------------------------------------------------------------
+  function render() {
+    $("#badge").hidden = !manual.enabled;
+
+    var idle = isIdleState(lastState);
+    $("#engage").disabled = !(manual.available && idle);
+    $("#release").disabled = !(manual.available && manual.enabled);
+
+    var hint;
+    if (!manual.available) {
+      hint = "Hardware bridge not active. Start the backend with HARDWARE_MODE=1 to use this console.";
+    } else if (manual.enabled && manual.pending) {
+      hint = "Trigger armed at " + manual.pan_deg + "° — waiting for the FSM to start the search.";
+    } else if (manual.enabled) {
+      hint = idle
+        ? "Engaged (idle). Real acoustic triggers are suppressed. Type an azimuth and press Engage."
+        : "Engaged. System is " + lastState + " — running the vision sequence for the last azimuth.";
+    } else if (!idle) {
+      hint = "System is " + lastState + ". Engage is available only while scanning.";
+    } else {
+      hint = "Ready. Type a PAN azimuth and press Engage.";
+    }
+    $("#hint").textContent = hint;
+
+    $("#mstatus").textContent = !manual.available ? "unavailable"
+      : manual.enabled ? (manual.pending ? ("armed → " + manual.pan_deg + "°")
+                                         : ("engaged · last " + manual.pan_deg + "°"))
+      : "released";
+  }
+
+  $("#engage").onclick = function () {
+    var v = parseFloat($("#angle").value);
+    if (isNaN(v)) return;
+    if (rangeKnown) { v = Math.max(panMin, Math.min(panMax, v)); $("#angle").value = v; }
+    send({ command: "manual_vision_test", enabled: true, pan_deg: v });
+  };
+  $("#release").onclick = function () {
+    send({ command: "manual_vision_test", enabled: false });
+  };
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  // ---- Video feed (client-side MJPEG decode, same approach as index.html) --
+  function startVideo() {
+    var canvas = $("#video");
+    var BOUNDARY = new TextEncoder().encode("--frame");
+    var HEADER_END = new TextEncoder().encode("\r\n\r\n");
+
+    function indexOf(hay, needle, from) {
+      var limit = hay.length - needle.length;
+      outer: for (var i = from; i <= limit; i++) {
+        for (var j = 0; j < needle.length; j++) { if (hay[i + j] !== needle[j]) continue outer; }
+        return i;
+      }
+      return -1;
+    }
+
+    async function drain(buf) {
+      while (true) {
+        var he = indexOf(buf, HEADER_END, 0);
+        if (he === -1) return buf;
+        var start = he + HEADER_END.length;
+        var nb = indexOf(buf, BOUNDARY, start);
+        if (nb === -1) return buf;
+        var jpeg = buf.slice(start, Math.max(start, nb - 2));
+        buf = buf.slice(nb);
+        if (jpeg.length === 0) continue;
+        try {
+          var bm = await createImageBitmap(new Blob([jpeg], { type: "image/jpeg" }));
+          if (canvas.width !== bm.width) canvas.width = bm.width;
+          if (canvas.height !== bm.height) canvas.height = bm.height;
+          canvas.getContext("2d").drawImage(bm, 0, 0);
+          $("#nosignal").hidden = true;
+          bm.close();
+        } catch (e) { /* skip undecodable part */ }
+      }
+    }
+
+    async function run() {
+      while (true) {
+        try {
+          var resp = await fetch("/video_feed", { cache: "no-store" });
+          if (!resp.body) throw new Error("no body");
+          var reader = resp.body.getReader();
+          var buf = new Uint8Array(0);
+          while (true) {
+            var r = await reader.read();
+            if (r.done) break;
+            var merged = new Uint8Array(buf.length + r.value.length);
+            merged.set(buf, 0); merged.set(r.value, buf.length);
+            buf = await drain(merged);
+          }
+        } catch (e) { /* retry below */ }
+        $("#nosignal").hidden = false;
+        await new Promise(function (res) { setTimeout(res, 1500); });
+      }
+    }
+    run();
+  }
+
+  connect();
+  startVideo();
+})();
+</script>
+</body>
+</html>

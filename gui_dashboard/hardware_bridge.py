@@ -99,6 +99,32 @@ _logmel_ran_this_call = False  # cnn_ms is only meaningful when compute_live_log
 _latest_spectrogram: Optional[np.ndarray] = None
 
 
+# --- Manual vision-test console (gui_dashboard/templates/manual_test.html, /manual) ---
+# A deliberately-separate engineering page lets the operator type a PAN azimuth
+# by hand instead of waiting for a real acoustic detection, to exercise the
+# vision pipeline (slew -> TILT macro-scan -> YOLO -> visual track) on demand.
+# Implemented purely as a substitution inside the already-wrapped
+# process_audio_buffer: while engaged, the acoustic model keeps running (its
+# confidence / DOA / spectrogram stay live for display) but the is_triggered
+# flag the FSM consumes is driven by hand -
+#   * "pending" (just after the operator hits Engage): assert is_triggered at
+#     the typed azimuth, so SCANNING -> TRACKING and the FSM commits to a
+#     search aimed there;
+#   * once the search is actually running (search_active()), release the
+#     injected trigger - from then search_active() itself feeds the FSM's
+#     lost-timer, so a full macro-scan + YOLO dwell runs and then times out
+#     cleanly back to SCANNING with no auto re-trigger;
+#   * while engaged but not pending: hold is_triggered False, i.e. suppress
+#     real acoustic triggers so the operator's keystroke is the only thing
+#     that moves the camera.
+# Off by default; released explicitly from the console. Zero effect on the
+# operational dashboard (index.html never sends the command or shows the panel).
+_manual_lock = threading.Lock()
+_manual_enabled = False
+_manual_pan_deg = 0.0
+_manual_pending = False
+
+
 def _patch_video_capture():
     """optical_master_loop's cv2.imshow call is the only place the fully
     rendered frame (box + banner already drawn by untouched code) exists.
@@ -189,6 +215,7 @@ def _patch_acoustic_confidence(acoustic_detector_cls):
             if _logmel_ran_this_call:
                 _stage_timings["cnn_ms"] = max(0.0, total_ms - _stage_timings["fft_ms"])
         _update_audio_ring(raw_buffer)
+        _apply_manual_vision_test(self)
         return score
 
     acoustic_detector_cls.compute_live_logmel = wrapped_logmel
@@ -517,6 +544,104 @@ def get_camera_pan_range():
     lo = getattr(_config_module, "MIN_ANGLE", -90.0)
     hi = getattr(_config_module, "MAX_ANGLE", 90.0)
     return (float(lo), float(hi))
+
+
+def _apply_manual_vision_test(acoustic_detector) -> None:
+    """Called at the tail of the wrapped process_audio_buffer (see
+    _patch_acoustic_confidence). Substitutes the operator-typed azimuth for the
+    acoustic trigger when the manual vision-test console is engaged - see the
+    module-level notes next to _manual_enabled."""
+    global _manual_pending
+    with _manual_lock:
+        if not _manual_enabled:
+            return
+        pending = _manual_pending
+        pan = _manual_pan_deg
+
+    # Hold the azimuth the FSM/search consume pinned to the operator's angle the
+    # whole time the mode is engaged - not just while the trigger is asserted.
+    # Once is_triggered is stood down, current_azimuth would otherwise revert to
+    # the live acoustic DOA, and step_acoustic_search()'s SEARCH_PAN_REPLAN_DEG
+    # check would re-plan the in-progress slew away from the typed target.
+    acoustic_detector.current_azimuth = float(pan)
+
+    if pending:
+        searching = False
+        try:
+            searching = bool(DroneSystem.video_processor.search_active())
+        except Exception:
+            searching = False
+        if searching:
+            # FSM has committed to the search - stand the injected trigger down.
+            with _manual_lock:
+                _manual_pending = False
+            acoustic_detector.is_triggered = False
+        else:
+            acoustic_detector.is_triggered = True
+    else:
+        acoustic_detector.is_triggered = False
+
+    # Keep the detector's own debounce/logging state machine quiet while we are
+    # driving is_triggered by hand, so it doesn't emit EVENT START/END spam
+    # every buffer fighting the forced value. Only these two integer debounce
+    # counters are touched - DSP, CNN and DOA smoothing all run untouched.
+    acoustic_detector.trigger_on_streak = 0
+    acoustic_detector.trigger_off_streak = 0
+
+
+def set_manual_vision_test(enabled: bool, pan_deg=None):
+    """Engage / release the manual vision-test mode. Returns (ok: bool, info: str).
+
+    Engaging requires the hardware bridge to be live and the FSM to be in
+    SCANNING, so the typed azimuth starts a fresh search exactly like a real
+    acoustic detection would. Releasing is always allowed and halts any
+    in-progress acoustic search immediately."""
+    global _manual_enabled, _manual_pan_deg, _manual_pending
+
+    if DroneSystem is None:
+        return False, "not_hardware_mode"
+
+    if not enabled:
+        with _manual_lock:
+            _manual_enabled = False
+            _manual_pending = False
+        try:
+            DroneSystem.video_processor.abort_acoustic_search()
+        except Exception as exc:
+            logger.warning("Manual vision test release - abort_acoustic_search failed: %s", exc)
+        logger.info("Manual vision test RELEASED - normal acoustic behaviour restored")
+        return True, "released"
+
+    try:
+        pan = float(pan_deg)
+    except (TypeError, ValueError):
+        return False, "bad_angle"
+    lo, hi = get_camera_pan_range()
+    pan = max(lo, min(hi, pan))
+
+    with DroneSystem.data_lock:
+        raw_state = DroneSystem.state.name
+    if raw_state != "SCANNING":
+        return False, f"not_scanning:{raw_state}"
+
+    with _manual_lock:
+        _manual_enabled = True
+        _manual_pan_deg = pan
+        _manual_pending = True
+    logger.info("Manual vision test ENGAGED - operator PAN azimuth %.1f deg (acoustic trigger substituted)", pan)
+    return True, f"engaged:{pan:.1f}"
+
+
+def get_manual_vision_test_status() -> dict:
+    """Snapshot for the /manual console (and the telemetry payload). Safe to
+    call in simulated mode - reports available=False."""
+    with _manual_lock:
+        return {
+            "available": DroneSystem is not None,
+            "enabled": _manual_enabled,
+            "pending": _manual_pending,
+            "pan_deg": round(_manual_pan_deg, 1),
+        }
 
 
 def get_fsm_state() -> str:

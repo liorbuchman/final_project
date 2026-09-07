@@ -60,6 +60,7 @@ _jtop_handle = None
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 INDEX_HTML_PATH = BASE_DIR / "templates" / "index.html"
+MANUAL_TEST_HTML_PATH = BASE_DIR / "templates" / "manual_test.html"
 RECORDINGS_DIR = BASE_DIR / "recordings"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
@@ -1231,6 +1232,7 @@ async def telemetry_loop():
                     "noise_count": runtime.acoustic_record_engine.noise_count,
                     "max_samples": runtime.acoustic_record_engine.max_samples,
                 },
+                "manual_test": hardware_bridge.get_manual_vision_test_status(),
             }
             record_if_active(payload)
             await manager.broadcast(payload)
@@ -1410,6 +1412,15 @@ async def on_shutdown():
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(INDEX_HTML_PATH.read_text(encoding="utf-8"))
+
+
+@app.get("/manual", response_class=HTMLResponse)
+async def manual_test_console():
+    """Separate engineering console: manual PAN-azimuth entry for exercising the
+    vision pipeline without a real acoustic detection. Deliberately NOT part of
+    the operational dashboard (index.html) - see templates/manual_test.html and
+    hardware_bridge.set_manual_vision_test()."""
+    return HTMLResponse(MANUAL_TEST_HTML_PATH.read_text(encoding="utf-8"))
 
 
 @app.get("/recordings")
@@ -1594,6 +1605,16 @@ async def ws_endpoint(websocket: WebSocket):
                 runtime.sim_badge_until = time.time() + 6.0
                 logger.info("Demo detection injected (SIM)")
                 await manager.broadcast({"type": "event", **ev})
+
+            elif command == "manual_vision_test":
+                ok, info = hardware_bridge.set_manual_vision_test(
+                    bool(msg.get("enabled", False)), msg.get("pan_deg")
+                )
+                if ok:
+                    logger.info("Manual vision test: %s", info)
+                else:
+                    logger.warning("Manual vision test command rejected: %s", info)
+                await manager.broadcast({"type": "manual_test", **hardware_bridge.get_manual_vision_test_status()})
 
             else:
                 logger.warning("Unknown command: %s", command)
