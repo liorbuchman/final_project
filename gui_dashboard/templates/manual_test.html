@@ -29,6 +29,9 @@
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
+  /* Author display rules (e.g. .no-signal { display:flex }) otherwise beat the
+     UA [hidden] rule, so el.hidden = true would not actually hide the node. */
+  [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; background: #0b0d10; color: #e5e7eb;
     font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; overflow: hidden; }
   .tnum { font-variant-numeric: tabular-nums; }
@@ -98,9 +101,9 @@
 
     <div class="panel">
       <h2>Operator PAN azimuth</h2>
-      <label for="angle">Target angle (degrees)</label>
-      <input type="number" id="angle" step="1" value="0">
-      <div class="range-hint">mechanical range: <span id="range" class="tnum">—</span></div>
+      <label for="angle">Target azimuth (0–360°)</label>
+      <input type="number" id="angle" step="1" min="0" max="360" value="0">
+      <div class="range-hint">same convention as the acoustic DOA readout · the camera cannot reach a narrow rear gap (≈176–184°)</div>
 
       <div class="btn-row">
         <button id="engage" disabled>Engage</button>
@@ -124,7 +127,6 @@
   "use strict";
   var $ = function (s) { return document.querySelector(s); };
 
-  var panMin = -175, panMax = 175, rangeKnown = false;
   var lastState = null;
   var manual = { available: false, enabled: false, pending: false, pan_deg: 0 };
 
@@ -150,19 +152,8 @@
       var m;
       try { m = JSON.parse(evt.data); } catch (e) { return; }
       if (m.type === "telemetry") onTelemetry(m);
-      else if (m.type === "camera_range") onRange(m);
       else if (m.type === "manual_test") { manual = m; render(); }
     };
-  }
-
-  function onRange(m) {
-    if (typeof m.min_deg === "number") panMin = m.min_deg;
-    if (typeof m.max_deg === "number") panMax = m.max_deg;
-    rangeKnown = true;
-    var a = $("#angle");
-    a.min = panMin; a.max = panMax;
-    $("#range").textContent = panMin + "°  …  " + panMax + "°";
-    render();
   }
 
   function onTelemetry(m) {
@@ -216,7 +207,8 @@
   $("#engage").onclick = function () {
     var v = parseFloat($("#angle").value);
     if (isNaN(v)) return;
-    if (rangeKnown) { v = Math.max(panMin, Math.min(panMax, v)); $("#angle").value = v; }
+    v = ((v % 360) + 360) % 360;   // wrap to 0..360, same as the acoustic DOA
+    $("#angle").value = v;
     send({ command: "manual_vision_test", enabled: true, pan_deg: v });
   };
   $("#release").onclick = function () {

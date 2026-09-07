@@ -616,8 +616,10 @@ def set_manual_vision_test(enabled: bool, pan_deg=None):
         pan = float(pan_deg)
     except (TypeError, ValueError):
         return False, "bad_angle"
-    lo, hi = get_camera_pan_range()
-    pan = max(lo, min(hi, pan))
+    # Operator types 0..360 deg, the same convention the ReSpeaker DOA reports.
+    # calculate_pan_movement() itself converts >180 -> negative and clamps to
+    # the mechanical MIN_ANGLE/MAX_ANGLE, so only a plain wrap is needed here.
+    pan = pan % 360.0
 
     with DroneSystem.data_lock:
         raw_state = DroneSystem.state.name

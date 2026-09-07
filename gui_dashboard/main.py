@@ -990,6 +990,54 @@ def stop_jtop():
         _jtop_handle = None
 
 
+def _jtop_gpu_load(handle) -> Optional[float]:
+    """GPU utilisation %, tolerant of jetson-stats layout differences:
+      3.x : jtop.gpu == {'val': <pct>, ...}
+      4.x : jtop.gpu == {'<gpu name>': {'status': {'load': <pct>}, ...}}
+    Returns None (-> 'N/A') if no known shape matches."""
+    try:
+        gpu = handle.gpu
+    except Exception:
+        return None
+    if isinstance(gpu, dict):
+        if isinstance(gpu.get("val"), (int, float)):
+            return float(gpu["val"])
+        for entry in gpu.values():
+            if isinstance(entry, dict):
+                status = entry.get("status")
+                if isinstance(status, dict) and isinstance(status.get("load"), (int, float)):
+                    return float(status["load"])
+                if isinstance(entry.get("load"), (int, float)):
+                    return float(entry["load"])
+    return None
+
+
+def _jtop_cpu_temp(handle) -> Optional[float]:
+    """CPU (or junction) temperature in deg C. jetson-stats 4.x on the Orin
+    Nano keys the thermal zones lowercase ('cpu', 'tj', ...) with
+    {'temp': <float>, 'online': bool} values; older/other builds used 'CPU'
+    and/or a bare float. Skips offline zones (they read -256)."""
+    try:
+        temps = handle.temperature
+    except Exception:
+        return None
+    if not isinstance(temps, dict):
+        return None
+    for key in ("cpu", "CPU", "tj", "TJ", "Tj", "CPU-therm"):
+        v = temps.get(key)
+        t = None
+        if isinstance(v, dict):
+            if v.get("online") is False:
+                continue
+            if isinstance(v.get("temp"), (int, float)):
+                t = float(v["temp"])
+        elif isinstance(v, (int, float)):
+            t = float(v)
+        if t is not None and t > -100:
+            return t
+    return None
+
+
 def jetson_metrics() -> dict:
     """jtop is authoritative on-device; psutil is the dev-machine fallback
     (no real GPU/temp reading on non-Jetson hardware -> 'N/A'). Reads the
@@ -1004,10 +1052,12 @@ def jetson_metrics() -> dict:
                 cores = _jtop_handle.cpu["cpu"]
                 core_list = cores.values() if isinstance(cores, dict) else cores
                 usages = [c["user"] for c in core_list if isinstance(c, dict) and "user" in c]
+                gpu_load = _jtop_gpu_load(_jtop_handle)
+                cpu_temp = _jtop_cpu_temp(_jtop_handle)
                 return {
                     "cpu": round(sum(usages) / max(1, len(usages)), 1),
-                    "gpu": round(_jtop_handle.gpu.get("val", 0), 1),
-                    "temp_c": round(_jtop_handle.temperature.get("CPU", {}).get("temp", 0), 1),
+                    "gpu": round(gpu_load, 1) if gpu_load is not None else None,
+                    "temp_c": round(cpu_temp, 1) if cpu_temp is not None else None,
                 }
         except Exception as exc:
             logger.warning("jtop read failed: %s", exc)
