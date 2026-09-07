@@ -112,7 +112,7 @@ class AcousticDetector:
         try:
             device = config.DEVICE
             self.model = SmallCNN(n_classes=2).to(device)
-            model_path = os.path.join(config.AUDIO_MODEL_DIR, "best_model.pt")
+            model_path = os.path.join(config.AUDIO_MODEL_DIR, "best_model_v2.pt")
 
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Model file not found exactly at: {model_path}")
