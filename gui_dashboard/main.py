@@ -990,11 +990,41 @@ def stop_jtop():
         _jtop_handle = None
 
 
+_jtop_shape_logged = False
+
+
+def _log_jtop_shape_once(handle):
+    """One-shot dump of the live jtop GPU / temperature / stats shape, emitted
+    the first time either reading comes back unresolved - so a board/version
+    whose layout none of the parsers below match can be diagnosed from the
+    GUI log alone instead of guessing."""
+    global _jtop_shape_logged
+    if _jtop_shape_logged:
+        return
+    _jtop_shape_logged = True
+    for name, getter in (("gpu", lambda: handle.gpu),
+                         ("temperature", lambda: handle.temperature),
+                         ("stats-keys", lambda: sorted(handle.stats.keys()))):
+        try:
+            logger.warning("jtop shape probe [%s]: %r", name, getter())
+        except Exception as exc:
+            logger.warning("jtop shape probe [%s]: raised %r", name, exc)
+
+
 def _jtop_gpu_load(handle) -> Optional[float]:
-    """GPU utilisation %, tolerant of jetson-stats layout differences:
-      3.x : jtop.gpu == {'val': <pct>, ...}
-      4.x : jtop.gpu == {'<gpu name>': {'status': {'load': <pct>}, ...}}
-    Returns None (-> 'N/A') if no known shape matches."""
+    """GPU utilisation %, tolerant of jetson-stats layout differences.
+      * jtop.stats['GPU']  - a flat percentage, the most version-stable source
+      * jtop.gpu 4.x       - {'<gpu name>': {'status': {'load': <pct>}, ...}}
+      * jtop.gpu 3.x       - {'val': <pct>, ...}
+    Returns None (-> 'N/A') if none match (e.g. jtop.gpu came back as {})."""
+    try:
+        stats = handle.stats
+        if isinstance(stats, dict):
+            for key in ("GPU", "gpu"):
+                if isinstance(stats.get(key), (int, float)):
+                    return float(stats[key])
+    except Exception:
+        pass
     try:
         gpu = handle.gpu
     except Exception:
@@ -1019,22 +1049,28 @@ def _jtop_cpu_temp(handle) -> Optional[float]:
     and/or a bare float. Skips offline zones (they read -256)."""
     try:
         temps = handle.temperature
+        if isinstance(temps, dict):
+            for key in ("cpu", "CPU", "tj", "TJ", "Tj", "CPU-therm"):
+                v = temps.get(key)
+                if isinstance(v, dict):
+                    if v.get("online") is False:
+                        continue
+                    t = v.get("temp")
+                    if isinstance(t, (int, float)) and t > -100:
+                        return float(t)
+                elif isinstance(v, (int, float)) and v > -100:
+                    return float(v)
     except Exception:
-        return None
-    if not isinstance(temps, dict):
-        return None
-    for key in ("cpu", "CPU", "tj", "TJ", "Tj", "CPU-therm"):
-        v = temps.get(key)
-        t = None
-        if isinstance(v, dict):
-            if v.get("online") is False:
-                continue
-            if isinstance(v.get("temp"), (int, float)):
-                t = float(v["temp"])
-        elif isinstance(v, (int, float)):
-            t = float(v)
-        if t is not None and t > -100:
-            return t
+        pass
+    try:
+        stats = handle.stats
+        if isinstance(stats, dict):
+            for key in ("Temp cpu", "Temp CPU", "Temp tj", "Temp TJ"):
+                v = stats.get(key)
+                if isinstance(v, (int, float)) and v > -100:
+                    return float(v)
+    except Exception:
+        pass
     return None
 
 
@@ -1054,6 +1090,8 @@ def jetson_metrics() -> dict:
                 usages = [c["user"] for c in core_list if isinstance(c, dict) and "user" in c]
                 gpu_load = _jtop_gpu_load(_jtop_handle)
                 cpu_temp = _jtop_cpu_temp(_jtop_handle)
+                if gpu_load is None or cpu_temp is None:
+                    _log_jtop_shape_once(_jtop_handle)
                 return {
                     "cpu": round(sum(usages) / max(1, len(usages)), 1),
                     "gpu": round(gpu_load, 1) if gpu_load is not None else None,
