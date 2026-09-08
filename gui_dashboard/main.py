@@ -739,11 +739,11 @@ class AcousticRecordEngine:
 # --------------------------------------------------------------------------
 
 class FSM:
-    STATES = ("IDLE", "SEARCHING", "SLEWING", "TRACKING", "ENGAGED", "DEGRADED")
+    STATES = ("IDLE", "SCANNING", "SLEWING", "TRACKING", "ENGAGED", "DEGRADED")
 
     def __init__(self):
         self.state = "IDLE"
-        self._pre_degraded_state = "SEARCHING"
+        self._pre_degraded_state = "SCANNING"
         self._slew_start: Optional[float] = None
         self._lost_lock_since: Optional[float] = None
         self._fusion_since: Optional[float] = None
@@ -771,14 +771,14 @@ class FSM:
         hardware_fault = not camera_ok or not mic_ok
         if hardware_fault:
             if self.state != "DEGRADED":
-                self._pre_degraded_state = self.state if self.state != "IDLE" else "SEARCHING"
+                self._pre_degraded_state = self.state if self.state != "IDLE" else "SCANNING"
                 self.state = "DEGRADED"
             return self.state
         elif self.state == "DEGRADED":
             self.state = self._pre_degraded_state
 
         if self.state == "IDLE":
-            self.state = "SEARCHING"
+            self.state = "SCANNING"
 
         visual_hit = bool(vision and vision.detections and vision.confidence >= settings["yolo_threshold_low"])
         acoustic_hit = bool(audio and audio.confidence >= settings["audio_threshold"])
@@ -787,7 +787,7 @@ class FSM:
             azimuth_agree = abs(vision.detections[0].azimuth_deg - audio.doa_deg) <= 15.0
         fused_hit = visual_hit and acoustic_hit and azimuth_agree
 
-        if self.state == "SEARCHING":
+        if self.state == "SCANNING":
             if acoustic_hit:
                 self.state = "SLEWING"
                 self._slew_start = now
@@ -808,7 +808,7 @@ class FSM:
                 if self._lost_lock_since is None:
                     self._lost_lock_since = now
                 elif (now - self._lost_lock_since) >= settings["lost_lock_timeout_s"]:
-                    self.state = "SEARCHING"
+                    self.state = "SCANNING"
                     self._lost_lock_since = None
                     self._fusion_since = None
             else:
