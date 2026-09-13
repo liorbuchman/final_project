@@ -21,6 +21,7 @@ results/
 *.onnx
 *.trt
 *.zip
+*.MOV
 uav_vision/models/
 uav_acoustic/models/
 uav_acoustic/data/
