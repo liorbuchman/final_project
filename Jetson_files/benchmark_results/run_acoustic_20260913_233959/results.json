@@ -1,0 +1,33 @@
+{
+  "mode": "acoustic",
+  "timestamp": "20260913_233959",
+  "args": {
+    "mode": "acoustic",
+    "video": null,
+    "vision_model": "/home/drone2026/final_project/Jetson_files/uav_vision/models/best_v10.engine",
+    "imgsz": "640",
+    "conf": 0.25,
+    "raw_predict": false,
+    "audio": "/home/drone2026/final_project/Jetson_files/test/canvas_00.wav",
+    "acoustic_model": "/home/drone2026/final_project/Jetson_files/uav_acoustic/models/best_model_v2.pt",
+    "warmup": 20,
+    "realtime_pacing": false,
+    "output_dir": "/home/drone2026/final_project/Jetson_files/benchmark_results"
+  },
+  "vision_results": [],
+  "acoustic_results": [
+    {
+      "model": "/home/drone2026/final_project/Jetson_files/uav_acoustic/models/best_model_v2.pt",
+      "stats": {
+        "count": 736,
+        "mean_ms": 7.247830845107441,
+        "median_ms": 6.939329000033467,
+        "p95_ms": 8.213742750058373,
+        "min_ms": 6.787773000269226,
+        "max_ms": 22.547402999862243,
+        "throughput_per_sec": 137.9723149409644,
+        "unit": "window"
+      }
+    }
+  ]
+}

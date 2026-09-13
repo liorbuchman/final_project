@@ -18,6 +18,7 @@ import json
 import time
 import argparse
 import threading
+import itertools
 import datetime
 import numpy as np
 
@@ -219,9 +220,19 @@ def benchmark_acoustic_model(checkpoint_path, audio_path, warmup, realtime_pacin
     for i in range(min(warmup, len(starts))):
         run_once(y[starts[i]:starts[i] + window_samples])
 
+    post_warmup_starts = starts[warmup:] or starts
+
+    # In 'both' mode a stop_event is supplied and the wav (almost always much
+    # shorter than the video) is looped for as long as vision keeps running,
+    # so acoustic genuinely contends for the GPU across the *entire* vision
+    # run instead of finishing early and leaving later models uncontested.
+    # In standalone 'acoustic' mode (stop_event is None) it's a single pass
+    # over the file, as before.
+    starts_iter = itertools.cycle(post_warmup_starts) if stop_event is not None else iter(post_warmup_starts)
+
     latencies = []
     next_due = time.perf_counter()
-    for start in starts[warmup:]:
+    for start in starts_iter:
         if stop_event is not None and stop_event.is_set():
             break
         t0 = time.perf_counter()
@@ -323,7 +334,7 @@ def build_arg_parser():
     p.add_argument("--audio", type=str, default=None,
                     help="Path to test .wav (required for --mode acoustic/both)")
     p.add_argument("--acoustic-model", type=str,
-                    default=os.path.join(SCRIPT_DIR, "uav_acoustic", "best_model.pt"))
+                    default=os.path.join(config.AUDIO_MODEL_DIR, "best_model_v2.pt"))
 
     # Common
     p.add_argument("--warmup", type=int, default=20,

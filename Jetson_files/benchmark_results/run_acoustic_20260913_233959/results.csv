@@ -1,0 +1,2 @@
+subsystem,model,imgsz,samples,mean_ms,median_ms,p95_ms,min_ms,max_ms,throughput_per_sec,unit
+acoustic,/home/drone2026/final_project/Jetson_files/uav_acoustic/models/best_model_v2.pt,,736,7.248,6.939,8.214,6.788,22.547,137.972,window

@@ -1,0 +1,5 @@
+subsystem,model,imgsz,samples,mean_ms,median_ms,p95_ms,min_ms,max_ms,throughput_per_sec,unit
+vision,/home/drone2026/final_project/Jetson_files/uav_vision/models/best_v640.engine,640,3295,22.050,22.191,25.308,16.595,50.344,45.351,frame
+vision,/home/drone2026/final_project/Jetson_files/uav_vision/models/best_v960.engine,960,3295,36.010,35.092,40.086,30.748,60.661,27.770,frame
+vision,/home/drone2026/final_project/Jetson_files/uav_vision/models/best_v1280.engine,1280,3295,36.649,36.732,39.185,31.908,55.750,27.286,frame
+vision,/home/drone2026/final_project/Jetson_files/uav_vision/models/best_v10.engine,1280,3295,36.417,36.380,39.101,31.582,56.271,27.460,frame
