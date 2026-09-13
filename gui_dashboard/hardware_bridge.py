@@ -49,12 +49,11 @@ JETSON_FILES_DIR = Path(__file__).resolve().parent.parent / "Jetson_files"
 SPEC_ROWS = 64
 SPEC_COLS = 48
 
-# FSM state names main_system.py doesn't use verbatim. The live SystemState
-# enum only has SCANNING/TRACKING/ENGAGED (no SLEWING - the new TRACKING state
-# covers both "slewing to the acoustic DOA" and "visually scanning" at once);
-# TRACKING/ENGAGED already match the frontend's vocabulary (SPEC.md §5) as-is,
-# so only SCANNING needs a rename. SLEWING simply never occurs in hardware mode.
-_STATE_NAME_MAP = {"SCANNING": "SEARCHING"}
+# The frontend uses the live SystemState enum names verbatim
+# (CALIBRATING / SCANNING / TRACKING / ENGAGED) - no renaming. The GUI-only
+# SLEWING state never occurs in hardware mode (the real TRACKING state covers
+# both "slewing to the acoustic DOA" and "visually scanning" at once).
+_STATE_NAME_MAP: dict[str, str] = {}
 
 _state_lock = threading.Lock()
 _latest_frame: Optional[np.ndarray] = None
@@ -659,7 +658,7 @@ def get_fsm_state() -> str:
         mic_ok = DroneSystem.acoustic_hw_status == "ONLINE"
     if not cam_ok or not mic_ok:
         return "DEGRADED"
-    return _STATE_NAME_MAP.get(raw_state, raw_state)
+    return _STATE_NAME_MAP.get(raw_state, raw_state)  # map currently a pass-through
 
 
 class HardwareVisionPipeline:

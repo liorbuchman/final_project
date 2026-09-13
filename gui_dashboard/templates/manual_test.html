@@ -44,7 +44,6 @@
   .state-pill { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; }
   .dot { width: 12px; height: 12px; border-radius: 50%; background: #6b7280; display: inline-block; }
   .dot[data-s="SCANNING"] { background: #3b82f6; }
-  .dot[data-s="SEARCHING"] { background: #3b82f6; }
   .dot[data-s="TRACKING"] { background: #f97316; }
   .dot[data-s="ENGAGED"] { background: #ef4444; }
   .dot[data-s="DEGRADED"] { background: #dc2626; }
@@ -169,10 +168,9 @@
 
   function pct(x) { return (x === null || x === undefined) ? "—" : Math.round(x * 100) + "%"; }
   function fmtDeg(x) { return (x === null || x === undefined) ? "—" : (Math.round(x * 10) / 10) + "°"; }
-  // The idle/acoustic-search state is "SCANNING" in the FSM enum but is
-  // surfaced to the frontend as "SEARCHING" by hardware_bridge's name map -
-  // accept either so this console works whichever vocabulary telemetry uses.
-  function isIdleState(s) { return s === "SCANNING" || s === "SEARCHING"; }
+  // The idle/acoustic-search state is "SCANNING" in the FSM enum, surfaced to
+  // the frontend verbatim. A manual test can only be engaged from this state.
+  function isIdleState(s) { return s === "SCANNING"; }
 
   // ---- Render -------------------------------------------------------------
   function render() {

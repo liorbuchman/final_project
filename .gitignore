@@ -24,6 +24,7 @@ results/
 uav_vision/models/
 uav_acoustic/models/
 uav_acoustic/data/
+uav_acoustic/evaluation/
 uav_acoustic/src/fine_tunning_model.py
 uav_acoustic/src/model_comparison.py
 uav_vision/src/recorded_drones/
@@ -38,6 +39,8 @@ __pycache__/
 .env
 venv/
 drone_env/
+drone-acoustic/
+drone-vision/
 *.pyc
 .DS_Store
 Thumbs.db

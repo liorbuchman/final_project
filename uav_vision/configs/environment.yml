@@ -1,33 +1,50 @@
-name: drone_env
+# ==========================================================================
+#  Development environment - VISION side
+#  (PTZ camera / ONVIF control, YOLO experiments, calibration & DOA test tools)
+# ==========================================================================
+#
+#  For a normal computer (Windows / Linux / macOS). Anyone who clones the
+#  repo can recreate it with:
+#
+#     conda env create -f uav_vision/configs/environment.yml
+#     conda activate drone-vision
+#
+#  Only packages actually imported by uav_vision/ are listed.
+#  (The acoustic side uses a separate env - uav_acoustic/configs/environment.yml.)
+#
+#  --------------------------------------------------------------------------
+#  !!  DO NOT use this file on the Jetson Orin Nano  !!
+#  --------------------------------------------------------------------------
+#  The Jetson runtime (Jetson_files/) needs JetPack-specific builds that are
+#  NOT interchangeable with the packages below:
+#    * PyTorch / torchvision  -> NVIDIA's JetPack (L4T) aarch64 wheels only
+#    * TensorRT               -> comes with JetPack; builds/runs the .engine model
+#    * OpenCV                 -> must be built WITH GStreamer to open the
+#                                nvv4l2decoder / nvvidconv camera pipeline
+#  A plain `conda env create` / `pip install` will NOT produce a working
+#  Jetson build - the versions must match the installed JetPack release.
+# ==========================================================================
+
+name: drone-vision
+
 channels:
-  - conda-forge
   - pytorch
+  - conda-forge
   - defaults
+
 dependencies:
   - python=3.10
-  - numpy
-  - scipy
-  - matplotlib
-  - pandas
-  - scikit-learn
-  - jupyterlab
+  - pip
+
+  # --- YOLO backend (ultralytics needs both) ---
   - pytorch
   - torchvision
-  - torchaudio
-  - cpuonly           
-  - numba             
-  - tqdm
-  - pyqt               
-  - pip
+  - cpuonly              # CPU inference on a normal dev machine
+
+  - numpy
+
   - pip:
-      - opencv-python
-      - ultralytics
-      - librosa
-      - sounddevice
-      - soundfile     
-      - pyaudio        
-      - pyqtgraph     
-      - mediapipe      
-      - onvif-zeep
-      - wsdiscovery
-      - requests
+      - opencv-python    # video capture + drawing (camera_model.py, doa_tracker.py, ...)
+      - ultralytics      # YOLOv8 detector / training / export
+      - onvif-zeep       # ONVIF PTZ control (camera_AC.py, calibrate_axis.py, ...)
+      - requests         # raw HTTP digest calls to the camera (light control, absolute move)
