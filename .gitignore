@@ -58,9 +58,8 @@ pc_dev/uav_acoustic/src/model_files/__init__.py
 pc_dev/uav_acoustic/configs/
 Jetson_files/benchmark_results/
 Jetson_files/inference_benchmark.py
-Jetson_files\benchmark_results/
-Jetson_files\inference_benchmark.py
-Jetson_files\uav_acoustic\test_acoustic_local.py
+Jetson_files/benchmark_results/
+Jetson_files/uav_acoustic/test_acoustic_local.py
 gui_dashboard/recordings/frames_*/
 gui_dashboard/recordings/acoustic_*/
 gui_dashboard/recordings/*.jsonl
