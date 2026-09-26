@@ -1,10 +1,11 @@
 # ComradeInBattle:Multi-Modal Drone Detection & Tracking System
+
 ## Authors
+Lior Buchman - B.Sc. Electrical Engineering, Afeka College
 
-*Lior Buchman - B.Sc. Electrical Engineering, Afeka College
-*Noy Maymon - B.Sc. Electrical Engineering, Afeka College
+Noy Maymon - B.Sc. Electrical Engineering, Afeka College
 
-
+## Background
 Final Electrical engineering project. The goal is simple to state and hard to do: **hear a
 drone, point a camera at it, confirm it visually, and keep the camera locked on it** —
 all in real time, on a small embedded computer.
