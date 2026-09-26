@@ -13,7 +13,7 @@ RTSP_URL = "rtsp://admin:admin@192.168.1.90:554/live/ch0"
 CAMERA_IP = '192.168.1.90'
 CAMERA_USER = 'admin'
 CAMERA_PASS = 'admin'
-YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "models", "best_v10.engine")
+YOLO_MODEL_PATH = os.path.join(BASE_DIR, "uav_vision", "models", "best_v640.engine")
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 YOLO_LOW_CONF_THRESHOLD = 0.25
@@ -31,7 +31,7 @@ IDVENDOR = 0x2886
 IDPRODUCT = 0x0018
 AUDIO_CHANNEL = 0
 AUDIO_CLASSIFICATION_THRESHOLD = 0.65
-AUDIO_TRIGGER_ON_CONFIRM_COUNT = 2  # consecutive buffers above threshold required to raise is_triggered (~0.4s at STEP_SECS)
+AUDIO_TRIGGER_ON_CONFIRM_COUNT = 1  # consecutive buffers above threshold required to raise is_triggered (~0.4s at STEP_SECS)
 AUDIO_TRIGGER_OFF_CONFIRM_COUNT = 4  # consecutive buffers below threshold required to clear is_triggered (~0.8s at STEP_SECS)
 #fft parameters
 SAMPLE_RATE = 16000
