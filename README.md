@@ -79,23 +79,28 @@ latching a permanent "lock".
 Jetson_files/            ← the real-time system that runs ON the Jetson
   main_system.py         ← entry point: starts all threads + the state machine
   config.py              ← every tunable parameter
+  inference_benchmark.py ← standalone on-device latency benchmark (acoustic/vision/both)
+  benchmark_results/     ← recorded benchmark runs (CSV + JSON)
   uav_acoustic/          ← audio capture, CNN inference, DOA, ReSpeaker LED driver
   uav_vision/            ← YOLO detector + ONVIF PTZ camera control
 
 gui_dashboard/           ← web dashboard (FastAPI + a single-file React page)
   main.py                ← the server; runs simulated sensors by default
   hardware_bridge.py     ← hooks into the LIVE Jetson system read-only, no edits to Jetson_files/
-  templates/             ← index.html (operator view), manual_test.html (engineering view)
+  templates/              ← index.html (operator view), manual_test.html (engineering view)
 
-uav_acoustic/            ← DEV ONLY: dataset cleaning, augmentation, CNN training
-uav_vision/              ← DEV ONLY: camera/PTZ calibration + DOA-tracking experiments
-usb_4_mic_array/         ← ReSpeaker vendor firmware & tuning tools (third-party)
+pc_dev/                  ← DEV ONLY, runs on a normal PC (not the Jetson)
+  uav_acoustic/          ← dataset cleaning, augmentation, CNN training
+  uav_vision/            ← camera/PTZ calibration + DOA-tracking experiments
+
+archive/                 ← retired code (old ReSpeaker vendor firmware, earlier system
+                            versions) — git-ignored, kept locally for reference only
 ```
 
 Datasets, recordings and trained model weights are **not** in the repo (see
 [`.gitignore`](.gitignore)) — they're too big. You need to supply/train your own:
 
-* `Jetson_files/uav_vision/models/best_v9.engine` — the TensorRT YOLO engine (YOLOv8n)
+* `Jetson_files/uav_vision/models/best_v640.engine` — the TensorRT YOLO engine (YOLOv8n)
 * `Jetson_files/uav_acoustic/models/` — the trained CNN checkpoint + normalization stats
 
 ---
@@ -136,20 +141,24 @@ on a normal PC they just show "N/A".
 
 ### 3. Training / experiments (any normal computer)
 
-The `uav_acoustic/` and `uav_vision/` folders (the top-level ones, **not** the copies
-inside `Jetson_files/`) are the development code. Each has its own self-contained conda
+The `pc_dev/uav_acoustic/` and `pc_dev/uav_vision/` folders (**not** the copies inside
+`Jetson_files/`) are the development code. Each has its own self-contained conda
 environment so anyone can recreate exactly what's needed:
 
 ```bash
-conda env create -f uav_acoustic/configs/environment.yml   # -> env "drone-acoustic"
-conda env create -f uav_vision/configs/environment.yml     # -> env "drone-vision"
+conda env create -f pc_dev/uav_acoustic/configs/environment.yml   # -> env "drone-acoustic"
+conda env create -f pc_dev/uav_vision/configs/environment.yml     # -> env "drone-vision"
 conda activate drone-acoustic     # or drone-vision, depending which part you're working on
 ```
 
 They're two separate environments (different names) — pick the one for the side you're
 touching. Both install CPU-only builds, so no CUDA/GPU setup is required to run them.
 
-Acoustic training pipeline: `uav_acoustic/src/model_files/`
+> `pc_dev/uav_acoustic/configs/` and `pc_dev/uav_vision/configs/` are git-ignored, so
+> `environment.yml` is **not** included in a fresh clone — build it yourself (or ask
+> whoever has a local copy) before running the command above.
+
+Acoustic training pipeline: `pc_dev/uav_acoustic/src/model_files/`
 (`cleaning.py` → `augmentation.py` → `preprocess_train.py` → `train.py`).
 YOLO is trained with the standard Ultralytics CLI/API on a labelled drone dataset, then
 exported to a TensorRT engine on the Jetson: `YOLO("best.pt").export(format="engine", half=True)`.
