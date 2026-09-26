@@ -6,6 +6,7 @@ audio/
 sounds/
 models/
 results/
+archive/
 
 # Media formats & Heavy Models
 *.wav
@@ -22,15 +23,29 @@ results/
 *.trt
 *.zip
 *.MOV
-uav_vision/models/
-uav_acoustic/models/
-uav_acoustic/data/
-uav_acoustic/evaluation/
-uav_acoustic/src/fine_tunning_model.py
-uav_acoustic/src/model_comparison.py
-uav_vision/src/recorded_drones/
-usb_4_mic_array
-UC/
+pc_dev/uav_vision/models/
+pc_dev/uav_vision/src/recorded_drones/
+pc_dev/uav_vision/configs/
+pc_dev/uav_vision/camera_test/
+pc_dev/uav_vision/src/wsdl/
+pc_dev/uav_vision/src/absolutemove_check.py
+pc_dev/uav_vision/src/field_record.py
+pc_dev/uav_vision/src/test_camera.py
+pc_dev/uav_acoustic/models/
+pc_dev/uav_acoustic/data/
+pc_dev/uav_acoustic/evaluation/
+pc_dev/uav_acoustic/src/fine_tunning_model.py
+pc_dev/uav_acoustic/src/model_comparison.py
+pc_dev/uav_acoustic/src/ReSpeaker_files/find_mic.py
+pc_dev/uav_acoustic/src/ReSpeaker_files/__init__.py
+pc_dev/uav_acoustic/src/model_files/__init__.py
+pc_dev/uav_acoustic/configs/
+Jetson_files/benchmark_results/
+Jetson_files/inference_benchmark.py
+
+
+
+
 
 # System & Environment
 __pycache__/
