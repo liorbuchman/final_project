@@ -23,6 +23,22 @@ archive/
 *.trt
 *.zip
 *.MOV
+__pycache__/
+.vscode/
+.idea/
+*.log
+.env
+venv/
+drone_env/
+drone-acoustic/
+drone-vision/
+*.pyc
+.DS_Store
+Thumbs.db
+6_channels_firmware.bin
+dfu.py
+.claude/
+
 pc_dev/uav_vision/models/
 pc_dev/uav_vision/src/recorded_drones/
 pc_dev/uav_vision/configs/
@@ -42,45 +58,15 @@ pc_dev/uav_acoustic/src/model_files/__init__.py
 pc_dev/uav_acoustic/configs/
 Jetson_files/benchmark_results/
 Jetson_files/inference_benchmark.py
-
-
-
-
-
-# System & Environment
-__pycache__/
-.vscode/
-.idea/
-*.log
-.env
-venv/
-drone_env/
-drone-acoustic/
-drone-vision/
-*.pyc
-.DS_Store
-Thumbs.db
-
-# gui_dashboard runtime state
-
-
-# gui_dashboard recorded training frames (already covered by recordings/ above,
-# listed explicitly too since these can grow large fast)
+Jetson_files\benchmark_results/
+Jetson_files\inference_benchmark.py
+Jetson_files\uav_acoustic\test_acoustic_local.py
 gui_dashboard/recordings/frames_*/
 gui_dashboard/recordings/acoustic_*/
 gui_dashboard/recordings/*.jsonl
 gui_dashboard/config.json
 gui_dashboard/CLAUDE.md
-
-# Mic array and firmware
-usb_4_mic_array/
-6_channels_firmware.bin
-dfu.py
-
-# Claude and AI specific files
-.claude/
 gui_dashboard/CLAUDE.md
 gui_dashboard/SPEC.md
-
-# Config files
 gui_dashboard/config.json
+usb_4_mic_array/
